@@ -1,0 +1,7 @@
+build/
+*.spv
+*.o
+*.obj
+*.exe
+__pycache__/
+.DS_Store
