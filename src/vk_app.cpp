@@ -170,6 +170,7 @@ void VulkanApp::run() {
     startTime_ = std::chrono::steady_clock::now();
     while (!window_->shouldClose()) {
         window_->pollEvents();
+        handleInput();
         drawFrame();
     }
     vkDeviceWaitIdle(device_);
@@ -178,7 +179,7 @@ void VulkanApp::run() {
 // ── init window ──────────────────────────────────────────────────────────
 
 void VulkanApp::initWindow() {
-    window_ = new X11Window("Morphon -- SDF Ray Marching", width_, height_);
+    window_ = new Win32Window("Morphon -- SDF Ray Marching", width_, height_);
 }
 
 // ── init vulkan ──────────────────────────────────────────────────────────
@@ -197,6 +198,7 @@ void VulkanApp::initVulkan() {
     createRenderPass();
     createDescriptors();
     createUniformBuffer();
+    createObjectBuffer();
     createPipeline();
     createFramebuffers();
     createCommandPool();
@@ -226,7 +228,7 @@ void VulkanApp::createInstance() {
     appInfo.engineVersion      = VK_MAKE_VERSION(0, 1, 0);
     appInfo.apiVersion         = VK_API_VERSION_1_3;
 
-    auto exts = X11Window::getVulkanExtensions();
+    auto exts = Win32Window::getVulkanExtensions();
 
     // Check which extensions are available
     uint32_t extCount;
@@ -498,28 +500,35 @@ void VulkanApp::createRenderPass() {
 // ── descriptors ──────────────────────────────────────────────────────────
 
 void VulkanApp::createDescriptors() {
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding         = 0;
-    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    binding.descriptorCount = 1;
-    binding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0].binding         = 0;
+    bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    bindings[1].binding         = 1;
+    bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslci{};
     dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = 1;
-    dslci.pBindings    = &binding;
+    dslci.bindingCount = 2;
+    dslci.pBindings    = bindings;
     VkResult res = vkCreateDescriptorSetLayout(device_, &dslci, nullptr, &descSetLayout_);
     if (res != VK_SUCCESS) throw std::runtime_error("Failed to create descriptor set layout");
 
-    VkDescriptorPoolSize poolSize{};
-    poolSize.type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSize.descriptorCount = 1;
+    VkDescriptorPoolSize poolSizes[2]{};
+    poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSizes[0].descriptorCount = 1;
+    poolSizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSizes[1].descriptorCount = 1;
 
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.maxSets       = 1;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes    = &poolSize;
+    dpci.poolSizeCount = 2;
+    dpci.pPoolSizes    = poolSizes;
 
     res = vkCreateDescriptorPool(device_, &dpci, nullptr, &descPool_);
     if (res != VK_SUCCESS) throw std::runtime_error("Failed to create descriptor pool");
@@ -570,6 +579,46 @@ void VulkanApp::createUniformBuffer() {
     wds.dstBinding      = 0;
     wds.descriptorCount = 1;
     wds.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    wds.pBufferInfo     = &dbi;
+    vkUpdateDescriptorSets(device_, 1, &wds, 0, nullptr);
+}
+
+// ── object SSBO ───────────────────────────────────────────────────────────
+
+void VulkanApp::createObjectBuffer() {
+    VkDeviceSize sz = sizeof(int32_t) * 4 + sizeof(PlacedObject) * MAX_OBJECTS;
+
+    VkBufferCreateInfo bci{};
+    bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size        = sz;
+    bci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult res = vkCreateBuffer(device_, &bci, nullptr, &objectBuffer_);
+    if (res != VK_SUCCESS) throw std::runtime_error("Failed to create object SSBO");
+
+    VkMemoryRequirements memReq;
+    vkGetBufferMemoryRequirements(device_, objectBuffer_, &memReq);
+
+    VkMemoryAllocateInfo mai{};
+    mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize  = memReq.size;
+    mai.memoryTypeIndex = findMemoryType(memReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    res = vkAllocateMemory(device_, &mai, nullptr, &objectMem_);
+    if (res != VK_SUCCESS) throw std::runtime_error("Failed to allocate SSBO memory");
+
+    vkBindBufferMemory(device_, objectBuffer_, objectMem_, 0);
+
+    VkDescriptorBufferInfo dbi{};
+    dbi.buffer = objectBuffer_;
+    dbi.range  = sz;
+
+    VkWriteDescriptorSet wds{};
+    wds.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wds.dstSet          = descSet_;
+    wds.dstBinding      = 1;
+    wds.descriptorCount = 1;
+    wds.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     wds.pBufferInfo     = &dbi;
     vkUpdateDescriptorSets(device_, 1, &wds, 0, nullptr);
 }
@@ -897,29 +946,260 @@ void VulkanApp::updateUniforms() {
     auto now = std::chrono::steady_clock::now();
     float t = std::chrono::duration<float>(now - startTime_).count();
 
-    // Input-driven camera (orbit with drag, zoom with scroll)
-    MouseState m = window_->consumeMouse();
-    if (m.leftDown) {
-        camTheta_ -= m.dx * 0.005f;
-        camPhi_   += m.dy * 0.005f;
-        camPhi_ = std::max(-1.5f, std::min(1.5f, camPhi_));
-    }
-    camDist_ *= (1.0f + m.scroll * 0.05f);
-    camDist_ = std::max(1.0f, std::min(50.0f, camDist_));
-
     float cx = camDist_ * std::cos(camPhi_) * std::sin(camTheta_);
     float cy = camDist_ * std::sin(camPhi_);
     float cz = camDist_ * std::cos(camPhi_) * std::cos(camTheta_);
 
+    MouseState curMouse = window_->getMouse();
+    float aspect = float(width_) / float(height_);
+    float ndcX = (2.0f * curMouse.x / float(width_) - 1.0f) * aspect;
+    float ndcY = -(2.0f * curMouse.y / float(height_) - 1.0f);
+
     UBO ubo{};
     ubo.time        = t;
+    ubo.mouseNdcX   = ndcX;
+    ubo.mouseNdcY   = ndcY;
+    ubo.editorMode  = static_cast<int32_t>(mode_);
     ubo.cameraPos   = {cx + camTarget_[0], cy + camTarget_[1], cz + camTarget_[2], 0.0f};
     ubo.cameraTarget= {camTarget_[0], camTarget_[1], camTarget_[2], 0.0f};
+    ubo.ghostPos    = {ghostPosX_, ghostPosY_, ghostPosZ_, ghostValid_ ? 1.0f : 0.0f};
 
     void* data;
     vkMapMemory(device_, uboMem_, 0, sizeof(UBO), 0, &data);
     std::memcpy(data, &ubo, sizeof(UBO));
     vkUnmapMemory(device_, uboMem_);
+}
+
+// ── input handling ────────────────────────────────────────────────────────
+
+void VulkanApp::handleInput() {
+    // Update camera from mouse deltas
+    MouseState md = window_->consumeMouse();
+    if (md.leftDown) {
+        camTheta_ -= md.dx * 0.005f;
+        camPhi_   += md.dy * 0.005f;
+        camPhi_ = std::max(-1.5f, std::min(1.5f, camPhi_));
+    }
+    camDist_ *= (1.0f + md.scroll * 0.05f);
+    camDist_ = std::max(1.0f, std::min(50.0f, camDist_));
+
+    // Mode switching
+    if (window_->isKeyDown('1')) mode_ = EditorMode::Navigate;
+    if (window_->isKeyDown('2')) mode_ = EditorMode::AddWall;
+    if (window_->isKeyDown('3')) mode_ = EditorMode::AddVoid;
+    if (window_->isKeyDown('X') || window_->isKeyDown('x')) {
+        if (!placedObjects_.empty())
+            placedObjects_.pop_back();
+    }
+
+    updateTitle();
+
+    // Compute ghost position via CPU ray-march (synced with placement)
+    auto m = window_->getMouse();
+    ghostValid_ = cpuRayMarch(m.x, m.y, ghostPosX_, ghostPosY_, ghostPosZ_);
+    if (ghostValid_) {
+        ghostPosX_ = std::floor(ghostPosX_) + 0.5f;
+        ghostPosZ_ = std::floor(ghostPosZ_) + 0.5f;
+        ghostPosY_ = (mode_ == EditorMode::AddVoid) ? (ghostPosY_ - 0.5f) : (ghostPosY_ + 0.5f);
+    }
+
+    // Place object on left click release (only if mouse didn't move much = click, not drag)
+    if (m.leftDown && !lastLeftDown_) {
+        clickStartX_ = m.x;
+        clickStartY_ = m.y;
+    }
+    if (!m.leftDown && lastLeftDown_) {
+        int dx = m.x - clickStartX_;
+        int dy = m.y - clickStartY_;
+        if (dx * dx + dy * dy < 16 && mode_ != EditorMode::Navigate) {
+            placeObject(m.x, m.y);
+        }
+    }
+    lastLeftDown_ = m.leftDown;
+}
+
+// ── CPU SDF helpers for placement ray march ──────────────────────────────
+
+static float cpuSdBox(const std::array<float, 3>& p, const std::array<float, 3>& b) {
+    float qx = std::abs(p[0]) - b[0];
+    float qy = std::abs(p[1]) - b[1];
+    float qz = std::abs(p[2]) - b[2];
+    float len = std::sqrt(std::max(qx, 0.0f) * std::max(qx, 0.0f) +
+                          std::max(qy, 0.0f) * std::max(qy, 0.0f) +
+                          std::max(qz, 0.0f) * std::max(qz, 0.0f));
+    float inner = std::max({qx, qy, qz});
+    return len + std::min(inner, 0.0f);
+}
+
+static float cpuSdSphere(const std::array<float, 3>& p, float r) {
+    return std::sqrt(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]) - r;
+}
+
+static float cpuSdTorus(const std::array<float, 3>& p, float r1, float r2) {
+    float qx = std::sqrt(p[0]*p[0] + p[2]*p[2]) - r1;
+    return std::sqrt(qx*qx + p[1]*p[1]) - r2;
+}
+
+static float cpuSdOctahedron(const std::array<float, 3>& p, float s) {
+    float ax = std::abs(p[0]), ay = std::abs(p[1]), az = std::abs(p[2]);
+    return (ax + ay + az - s) * 0.57735027f;
+}
+
+static void cpuOpRepeat(std::array<float, 3>& p, const std::array<float, 3>& c) {
+    auto round = [](float v) { return std::floor(v + 0.5f); };
+    for (int i = 0; i < 3; i++)
+        if (c[i] != 0.0f)
+            p[i] = p[i] - c[i] * round(p[i] / c[i]);
+}
+
+static float cpuScene(const std::array<float, 3>& p, float t,
+                      const std::vector<PlacedObject>& objects) {
+    // Bouncing box
+    std::array<float, 3> bp = {p[0] + 1.8f, p[1], p[2]};
+    float bounce = std::abs(std::sin(t * 0.8f)) * 0.8f + 0.2f;
+    bp[1] -= bounce - 0.3f;
+    float box = cpuSdBox(bp, {0.5f, 0.5f, 0.5f});
+
+    // Rotating torus
+    std::array<float, 3> tp = {p[0] - 1.8f, p[1], p[2]};
+    float ang = t * 0.5f;
+    float ca = std::cos(ang), sa = std::sin(ang);
+    float tpx = ca * tp[0] + sa * tp[2];
+    float tpz = -sa * tp[0] + ca * tp[2];
+    float torus = cpuSdTorus({tpx, tp[1], tpz}, 0.7f, 0.3f);
+
+    // Ground
+    float ground = p[1] - (-1.5f);
+
+    // Sphere
+    std::array<float, 3> sp = p;
+    sp[1] += std::sin(std::sqrt(sp[0]*sp[0] + sp[2]*sp[2]) * 2.0f + t * 1.5f) * 0.08f;
+    float sphere = cpuSdSphere(sp, 0.8f);
+
+    // Octahedron
+    std::array<float, 3> op = p;
+    op[1] += 2.5f;
+    cpuOpRepeat(op, {2.5f, 0.0f, 2.5f});
+    op[1] += std::sin(t * 0.7f + op[0] * 2.0f + op[2] * 1.3f) * 0.2f;
+    float oct = cpuSdOctahedron(op, 0.25f);
+
+    float d = std::min(box, torus);
+    d = std::min(d, sphere);
+    d = std::min(d, ground);
+    // smooth union approximation
+    { float h = std::clamp(0.5f + 0.5f * (oct - d) / 0.1f, 0.0f, 1.0f);
+      d = std::min(oct, d) - 0.1f * h * (1.0f - h); }
+
+    // Placed objects
+    for (auto& obj : objects) {
+        std::array<float, 3> cp = {p[0] - obj.px, p[1] - obj.py, p[2] - obj.pz};
+        float od = cpuSdBox(cp, {obj.sx, obj.sy, obj.sz});
+        if (obj.type < 0.5f)
+            d = std::min(d, od);
+        else
+            d = std::max(d, -od);
+    }
+
+    return d;
+}
+
+bool VulkanApp::cpuRayMarch(int screenX, int screenY, float& hx, float& hy, float& hz) {
+    float aspect = float(width_) / float(height_);
+    float ndcX = (2.0f * screenX / float(width_) - 1.0f) * aspect;
+    float ndcY = -(2.0f * screenY / float(height_) - 1.0f);
+    float fov = 1.0f;
+
+    float cx = camDist_ * std::cos(camPhi_) * std::sin(camTheta_);
+    float cy = camDist_ * std::sin(camPhi_);
+    float cz = camDist_ * std::cos(camPhi_) * std::cos(camTheta_);
+    float rox = cx + camTarget_[0], roy = cy + camTarget_[1], roz = cz + camTarget_[2];
+
+    float fdx = camTarget_[0] - rox, fdy = camTarget_[1] - roy, fdz = camTarget_[2] - roz;
+    float flen = std::sqrt(fdx*fdx + fdy*fdy + fdz*fdz);
+    fdx /= flen; fdy /= flen; fdz /= flen;
+
+    float rux = fdy * 0.0f - fdz * 1.0f;
+    float ruy = fdz * 0.0f - fdx * 0.0f;
+    float ruz = fdx * 1.0f - fdy * 0.0f;
+    float rlen = std::sqrt(rux*rux + ruy*ruy + ruz*ruz);
+    if (rlen > 1e-8f) { rux /= rlen; ruy /= rlen; ruz /= rlen; }
+
+    float upx = ruy * fdz - ruz * fdy;
+    float upy = ruz * fdx - rux * fdz;
+    float upz = rux * fdy - ruy * fdx;
+
+    float rdx = fdx + rux * ndcX * fov + upx * ndcY * fov;
+    float rdy = fdy + ruy * ndcX * fov + upy * ndcY * fov;
+    float rdz = fdz + ruz * ndcX * fov + upz * ndcY * fov;
+    float rdlen = std::sqrt(rdx*rdx + rdy*rdy + rdz*rdz);
+    rdx /= rdlen; rdy /= rdlen; rdz /= rdlen;
+
+    auto now = std::chrono::steady_clock::now();
+    float t = std::chrono::duration<float>(now - startTime_).count();
+
+    float dist = 0.0f;
+    bool hit = false;
+    for (int i = 0; i < 64; i++) {
+        std::array<float, 3> p = {rox + rdx * dist, roy + rdy * dist, roz + rdz * dist};
+        float d = cpuScene(p, t, placedObjects_);
+        if (d < 0.01f || dist > 30.0f) {
+            if (d < 0.01f) hit = true;
+            break;
+        }
+        dist += d;
+    }
+
+    if (hit) {
+        hx = rox + rdx * dist;
+        hy = roy + rdy * dist;
+        hz = roz + rdz * dist;
+        return true;
+    }
+    return false;
+}
+
+void VulkanApp::placeObject(int, int) {
+    if (!ghostValid_) return;
+
+    PlacedObject obj{};
+    obj.type = (mode_ == EditorMode::AddVoid) ? 1.0f : 0.0f;
+    obj.sx = 0.5f; obj.sy = 0.5f; obj.sz = 0.5f;
+    obj.px = ghostPosX_;
+    obj.py = ghostPosY_;
+    obj.pz = ghostPosZ_;
+    obj.pw = 0.0f;
+    placedObjects_.push_back(obj);
+    updateObjectBuffer();
+}
+
+void VulkanApp::updateTitle() {
+    const char* modeStr = "Navigate";
+    switch (mode_) {
+        case EditorMode::Navigate: modeStr = "Navigate"; break;
+        case EditorMode::AddWall:  modeStr = "Add Wall"; break;
+        case EditorMode::AddVoid:  modeStr = "Add Void"; break;
+    }
+    char title[128];
+    std::snprintf(title, sizeof(title), "Morphon -- SDF Ray Marching [%s] (%zu objects)", modeStr, placedObjects_.size());
+    window_->setTitle(title);
+}
+
+void VulkanApp::updateObjectBuffer() {
+    struct ObjectBufferData {
+        int32_t count;
+        int32_t pad0, pad1, pad2;
+        PlacedObject objects[MAX_OBJECTS];
+    };
+
+    ObjectBufferData data{};
+    data.count = static_cast<int32_t>(placedObjects_.size());
+    for (size_t i = 0; i < placedObjects_.size(); ++i)
+        data.objects[i] = placedObjects_[i];
+
+    void* mapped;
+    vkMapMemory(device_, objectMem_, 0, sizeof(ObjectBufferData), 0, &mapped);
+    std::memcpy(mapped, &data, sizeof(ObjectBufferData));
+    vkUnmapMemory(device_, objectMem_);
 }
 
 // ── utility ──────────────────────────────────────────────────────────────
@@ -945,6 +1225,8 @@ void VulkanApp::cleanup() {
         vkDestroyFramebuffer(device_, f.framebuffer, nullptr);
         vkDestroyImageView(device_, f.imageView, nullptr);
     }
+    vkDestroyBuffer(device_, objectBuffer_, nullptr);
+    vkFreeMemory(device_, objectMem_, nullptr);
     vkDestroyBuffer(device_, ubo_, nullptr);
     vkFreeMemory(device_, uboMem_, nullptr);
     vkDestroyDescriptorPool(device_, descPool_, nullptr);

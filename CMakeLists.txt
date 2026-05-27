@@ -43,10 +43,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(volk)
 
-# ─── X11 (window system, headers bundled locally) ────────────────────────
-set(X11_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/include")
-set(X11_LIB_DIR     "${CMAKE_CURRENT_SOURCE_DIR}/external/lib")
-
 # ─── Shader sources dependency marker ────────────────────────────────────
 file(GLOB_RECURSE SHADER_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.vert
@@ -59,10 +55,10 @@ add_custom_target(shader_deps DEPENDS ${SHADER_SOURCES})
 add_executable(Morphon
   src/main.cpp
   src/vk_app.cpp
-  src/x11_window.cpp
+  src/win32_window.cpp
 )
 
-target_compile_definitions(Morphon PRIVATE VK_USE_PLATFORM_XLIB_KHR)
+target_compile_definitions(Morphon PRIVATE VK_USE_PLATFORM_WIN32_KHR)
 
 target_link_libraries(Morphon PRIVATE
   Vulkan::Headers
@@ -71,16 +67,12 @@ target_link_libraries(Morphon PRIVATE
   glslang::SPIRV
   MachineIndependent
   GenericCodeGen
-  dl
-  pthread
-  ${X11_LIB_DIR}/libX11.so
 )
 
 target_include_directories(Morphon PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${glslang_SOURCE_DIR}
   ${glslang_SOURCE_DIR}/SPIRV
-  ${X11_INCLUDE_DIR}
 )
 
 # Re-link when shaders change

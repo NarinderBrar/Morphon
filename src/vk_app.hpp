@@ -1,6 +1,6 @@
 #pragma once
 
-#include "x11_window.hpp"
+#include "win32_window.hpp"
 #include <volk.h>
 
 #include <array>
@@ -8,6 +8,20 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+
+enum class EditorMode {
+    Navigate,
+    AddWall,
+    AddVoid
+};
+
+struct PlacedObject {
+    float type;       // 0 = wall, 1 = void
+    float sx, sy, sz; // half-extents
+    float px, py, pz, pw; // position (pw unused)
+};
+
+static constexpr int MAX_OBJECTS = 256;
 
 class VulkanApp {
 public:
@@ -17,10 +31,20 @@ public:
 
 private:
     // Window
-    X11Window* window_ = nullptr;
+    Win32Window* window_ = nullptr;
     int width_ = 0, height_ = 0;
     bool resized_ = false;
     std::chrono::steady_clock::time_point startTime_;
+
+    // Editor state
+    EditorMode mode_ = EditorMode::Navigate;
+    std::vector<PlacedObject> placedObjects_;
+    bool lastLeftDown_ = false;
+    int  clickStartX_ = 0, clickStartY_ = 0;
+
+    // Ghost preview (CPU ray-march result, synced with GPU)
+    float ghostPosX_ = 0.0f, ghostPosY_ = 0.0f, ghostPosZ_ = 0.0f;
+    bool ghostValid_ = false;
 
     // Vulkan core
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -47,9 +71,13 @@ private:
     VkDescriptorSetLayout descSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSet descSet_ = VK_NULL_HANDLE;
 
-    // UBO
+    // UBO (binding 0)
     VkBuffer ubo_ = VK_NULL_HANDLE;
     VkDeviceMemory uboMem_ = VK_NULL_HANDLE;
+
+    // SSBO for placed objects (binding 1)
+    VkBuffer objectBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory objectMem_ = VK_NULL_HANDLE;
 
     // Per-frame data
     struct Frame {
@@ -74,9 +102,12 @@ private:
     // Uniform buffer data
     struct UBO {
         float time;
-        float pad[3];
+        float mouseNdcX;
+        float mouseNdcY;
+        int32_t editorMode;
         alignas(16) std::array<float, 4> cameraPos;
         alignas(16) std::array<float, 4> cameraTarget;
+        alignas(16) std::array<float, 4> ghostPos; // xyz = position, w = valid flag
     };
 
     // Init helpers
@@ -93,6 +124,7 @@ private:
     void createRenderPass();
     void createDescriptors();
     void createUniformBuffer();
+    void createObjectBuffer();
     VkShaderModule compileShader(const std::string& path, VkShaderStageFlagBits stage);
     void createPipeline();
     void createFramebuffers();
@@ -104,6 +136,11 @@ private:
     void rebuildSwapchain();
     void recordCommandBuffer(Frame& frame, uint32_t imageIndex);
     void updateUniforms();
+    void handleInput();
+    void placeObject(int screenX, int screenY);
+    bool cpuRayMarch(int screenX, int screenY, float& hx, float& hy, float& hz);
+    void updateTitle();
+    void updateObjectBuffer();
     void drawFrame();
 
     uint32_t findMemoryType(uint32_t filter, VkMemoryPropertyFlags props);
