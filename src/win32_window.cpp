@@ -1,5 +1,7 @@
 #include "win32_window.hpp"
 
+extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -110,6 +112,9 @@ LRESULT CALLBACK Win32Window::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     }
 
     if (win) {
+        if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
+            return true;
+
         switch (msg) {
         case WM_CLOSE:
             win->closed_ = true;

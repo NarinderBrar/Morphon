@@ -14,13 +14,27 @@ layout (binding = 0) uniform UBO {
     float _pad1;
     vec3  ghostPos;
     float ghostValid;
+    vec4  ghostPrimInfo; // x=primType, y=param1, z=param2, w=unused
+    vec3  selectedPos;
+    float selectedValid;
+    vec4  selectedPrimInfo; // x=primType, y=param1, z=param2, w=showGizmo
+    vec3  camRight;
+    float _pad2;
+    vec3  camUp;
+    float _pad3;
+    uint  hiddenFlags[8];
+
+    // Multi-selection
+    int   selectedCount;
+    vec4  selPos[32];
+    vec4  selInfo[32];
 } ubo;
 
 #define MAX_OBJECTS 256
 
 struct PlacedObject {
-    vec4 type_size;
-    vec4 pos;
+    vec4 meta;  // x=type, y=primType, z=param1, w=param2
+    vec4 pos;   // xyz=position, w=hidden
 };
 
 layout (binding = 1, std430) readonly buffer ObjectBuffer {
@@ -43,74 +57,79 @@ float sdTorus(vec3 p, vec2 t) {
     return length(q) - t.y;
 }
 
-float sdPlane(vec3 p, float h) { return p.y - h; }
-
-float sdOctahedron(vec3 p, float s) {
-    p = abs(p);
-    return (p.x + p.y + p.z - s) * 0.57735027;
+float sdCylinder(vec3 p, float h, float r) {
+    vec2 d = abs(vec2(length(p.xz), p.y)) - vec2(r, h);
+    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
 }
+
+float sdCone(vec3 p, float h, float r) {
+    vec2 q = vec2(length(p.xz), p.y);
+    vec2 tip = vec2(r, -h);
+    vec2 base = q - tip;
+    float d = length(max(base, 0.0));
+    float m = min(max(base.x, base.y), 0.0);
+    return d + m;
+}
+
+float sdPlane(vec3 p, float h) { return p.y - h; }
 
 // ── Operations ───────────────────────────────────────────────────────────
 
 float opUnion(float a, float b) { return min(a, b); }
 float opSubtract(float a, float b) { return max(a, -b); }
+float opIntersect(float a, float b) { return max(a, b); }
 
 float opSmoothUnion(float a, float b, float k) {
     float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 
-vec3 opRepeat(vec3 p, vec3 c) {
-    return p - c * round(p / c);
+// ── Object evaluator ─────────────────────────────────────────────────────
+
+float evalObject(vec3 p, PlacedObject obj) {
+    int primType = int(obj.meta.y);
+    float p1 = obj.meta.z;
+    float p2 = obj.meta.w;
+    vec3 op = p - obj.pos.xyz;
+
+    float d;
+    if (primType == 0) { // Box
+        d = sdBox(op, vec3(p1));
+    } else if (primType == 1) { // Sphere
+        d = sdSphere(op, p1);
+    } else if (primType == 2) { // Donut (torus)
+        d = sdTorus(op, vec2(p1, p2));
+    } else if (primType == 3) { // Cylinder
+        d = sdCylinder(op, p1, p2);
+    } else if (primType == 4) { // Pyramid (cone)
+        d = sdCone(op, p1, p2);
+    } else {
+        d = sdBox(op, vec3(0.5));
+    }
+    return d;
 }
 
 // ── Scene ────────────────────────────────────────────────────────────────
 
 float scene(vec3 p) {
-    float t = ubo.time;
-
-    vec3 bp = p;
-    bp.x += 1.8f;
-    float bounce = abs(sin(t * 0.8f)) * 0.8f + 0.2f;
-    bp.y -= bounce - 0.3f;
-    float box = sdBox(bp, vec3(0.5f, 0.5f, 0.5f));
-
-    vec3 tp = p;
-    tp.x -= 1.8f;
-    float ang = t * 0.5f;
-    float ca = cos(ang), sa = sin(ang);
-    tp = vec3(ca * tp.x + sa * tp.z, tp.y, -sa * tp.x + ca * tp.z);
-    float torus = sdTorus(tp, vec2(0.7f, 0.3f));
-
     float ground = sdPlane(p, -1.5f);
-
-    vec3 sp = p;
-    sp.y += sin(length(sp.xz) * 2.0f + t * 1.5f) * 0.08f;
-    float sphere = sdSphere(sp, 0.8f);
-
-    vec3 op = p;
-    op.y += 2.5f;
-    op = opRepeat(op, vec3(2.5f, 0.0f, 2.5f));
-    op.y += sin(t * 0.7f + op.x * 2.0f + op.z * 1.3f) * 0.2f;
-    float oct = sdOctahedron(op, 0.25f);
-
-    float d = opUnion(box, torus);
-    d = opUnion(d, sphere);
-    d = opUnion(d, ground);
-    d = opSmoothUnion(d, oct, 0.1f);
+    float d = ground;
 
     int objCount = min(objBuf.count, MAX_OBJECTS);
     for (int i = 0; i < MAX_OBJECTS; i++) {
         if (i >= objCount) break;
-        vec3 h = objBuf.objects[i].type_size.yzw;
-        vec3 cpos = objBuf.objects[i].pos.xyz;
-        float objDist = sdBox(p - cpos, h);
-        if (objBuf.objects[i].type_size.x < 0.5f)
+
+        // Skip hidden objects
+        uint word = ubo.hiddenFlags[i >> 5];
+        uint bit = (word >> (i & 31)) & 1u;
+        if (bit != 0u) continue;
+
+        float objDist = evalObject(p, objBuf.objects[i]);
+        if (objBuf.objects[i].meta.x < 0.5f)
             d = opUnion(d, objDist);
         else
             d = opSubtract(d, objDist);
     }
-
     return d;
 }
 
@@ -124,7 +143,7 @@ MarchResult march(vec3 ro, vec3 rd) {
     for (int i = 0; i < 128; i++) {
         vec3 p = ro + rd * t;
         float d = scene(p);
-        if (d < 0.001f || t > 50.0f) break;
+        if (d < 0.002f || t > 50.0f) break;
         t += d;
         steps = i;
     }
@@ -132,7 +151,16 @@ MarchResult march(vec3 ro, vec3 rd) {
 }
 
 vec3 normal(vec3 p) {
-    const float e = 0.001f;
+    int nc = min(objBuf.count, MAX_OBJECTS);
+    bool nearVoid = false;
+    for (int i = 0; i < MAX_OBJECTS; i++) {
+        if (i >= nc) break;
+        if (objBuf.objects[i].meta.x < 0.5f) continue;
+        float od = evalObject(p, objBuf.objects[i]);
+        if (od < 0.1f) { nearVoid = true; break; }
+    }
+
+    float e = nearVoid ? 0.008f : 0.001f;
     vec2 eps = vec2(e, 0.0f);
     return normalize(vec3(
         scene(p + eps.xyy) - scene(p - eps.xyy),
@@ -186,14 +214,11 @@ void main() {
 
     float aspect = 16.0f / 9.0f;
     vec2 ndc = uv * 2.0f - 1.0f;
-    vec2 ndcEdge = ndc; // non-aspect-corrected for wireframe edge test
+    vec2 ndcEdge = ndc;
     ndc.x *= aspect;
 
     float fov = 1.0f;
     vec3 rd = normalize(fwd + right * ndc.x * fov + up * ndc.y * fov);
-
-    // Ghost preview center from CPU ray-march (passed via UBO)
-    vec3 ghostCenter = ubo.ghostPos;
 
     MarchResult res = march(ro, rd);
 
@@ -238,18 +263,15 @@ void main() {
             }
         }
 
-        // Check if hit point is on a wall or void surface
         bool onVoid = false;
         bool onWall = false;
-        float eps = 0.01f;
+        float eps = 0.05f;
         int nc = min(objBuf.count, MAX_OBJECTS);
         for (int i = 0; i < MAX_OBJECTS; i++) {
             if (i >= nc) break;
-            vec3 h = objBuf.objects[i].type_size.yzw;
-            vec3 cpos = objBuf.objects[i].pos.xyz;
-            float od = sdBox(p - cpos, h);
+            float od = evalObject(p, objBuf.objects[i]);
             if (od < eps) {
-                if (objBuf.objects[i].type_size.x > 0.5f)
+                if (objBuf.objects[i].meta.x > 0.5f)
                     onVoid = true;
                 else
                     onWall = true;
@@ -263,12 +285,9 @@ void main() {
         lighting *= ambient;
 
         if (onVoid) {
-            // Void: dark abyss - deep purple/black with faint glow
-            vec3 voidCol = vec3(0.05f, 0.0f, 0.08f) * lighting;
-            voidCol += vec3(0.03f, 0.0f, 0.05f);
+            vec3 voidCol = vec3(0.0f, 0.8f, 0.9f) * lighting * 0.5f + vec3(1.0f) * spec * shadow * 0.25f;
             col = voidCol;
         } else if (onWall) {
-            // Wall: cyan accent
             vec3 wallCol = vec3(0.0f, 0.8f, 0.9f) * lighting + vec3(1.0f) * spec * shadow * 0.5f;
             col = wallCol;
         } else {
@@ -280,82 +299,298 @@ void main() {
         col = mix(col, vec3(0.02f, 0.02f, 0.05f), fog);
     }
 
-    // ── HUD bottom bar ───────────────────────────────────────────────────
-    vec3 accentCol = vec3(0.3f, 0.5f, 0.8f);
-    if (ubo.editorMode == 1) accentCol = vec3(0.0f, 0.8f, 0.8f);
-    if (ubo.editorMode == 2) accentCol = vec3(0.8f, 0.2f, 0.2f);
-
-    float hudY = uv.y;
-    float hudFade = smoothstep(0.0f, 0.04f, hudY) * (1.0f - smoothstep(0.08f, 0.14f, hudY));
-    if (hudFade > 0.0f) {
-        col = mix(col, vec3(0.04f, 0.04f, 0.06f), hudFade * 0.85f);
-    }
-
-    // Accent line
-    float accentLine = smoothstep(0.002f, 0.0f, abs(hudY - 0.08f));
-    col = mix(col, accentCol, accentLine * 0.5f);
-
-    // Mode indicator dots
-    float dotR = 0.012f;
-    vec2 dotBase = vec2(0.5f - 0.20f, 0.055f);
-    for (int i = 0; i < 3; i++) {
-        vec2 dc = uv - dotBase - vec2(float(i) * 0.08f, 0.0f);
-        dc.x *= aspect;
-        float dd = length(dc);
-        float dotFill = 1.0f - smoothstep(dotR * 0.8f, dotR, dd);
-        vec3 dotCol = vec3(0.15f);
-        if (i == 0) dotCol = vec3(0.3f, 0.5f, 0.8f);
-        if (i == 1) dotCol = vec3(0.0f, 0.8f, 0.8f);
-        if (i == 2) dotCol = vec3(0.8f, 0.2f, 0.2f);
-        if (i == ubo.editorMode) {
-            // Glow ring around active
-            float ring = 1.0f - smoothstep(dotR * 1.2f, dotR * 1.8f, dd);
-            col = mix(col, dotCol * 1.5f, ring * 0.3f);
-        }
-        col = mix(col, dotCol, dotFill * 0.8f);
-    }
-
-    // ── Wireframe ghost preview ──────────────────────────────────────────
+    // ── Shape-aware ghost preview ──────────────────────────────
     if (ubo.editorMode != 0 && ubo.ghostValid > 0.5f) {
-        vec3 hf = vec3(0.5f);
-        vec3 corners[8];
-        for (int i = 0; i < 8; i++) {
-            float bx = float(i & 1) * 2.0f - 1.0f;
-            float by = float((i >> 1) & 1) * 2.0f - 1.0f;
-            float bz = float((i >> 2) & 1) * 2.0f - 1.0f;
-            corners[i] = ghostCenter + hf * vec3(bx, by, bz);
+        vec3 gp = ubo.ghostPos;
+        float gType = ubo.ghostPrimInfo.x;
+        float gP1 = ubo.ghostPrimInfo.y;
+        float gP2 = ubo.ghostPrimInfo.z;
+
+        vec3 ghostCol = (ubo.editorMode == 1) ? vec3(0.0, 1.0, 1.0) : vec3(1.0, 0.2, 0.2);
+        float lineW = 0.006f;
+        float bestDist = 1e10f;
+
+        #define EDGE_SEG(wa, wb) { \
+            vec3 _d_sa_ = (wa) - ro; \
+            float _vz_sa_ = dot(_d_sa_, fwd); \
+            vec2 _sa_ = _vz_sa_ <= 0.001 ? vec2(1e10) : (vec2(dot(_d_sa_, right), dot(_d_sa_, up)) / (_vz_sa_ * fov) / vec2(aspect, 1)); \
+            vec3 _d_sb_ = (wb) - ro; \
+            float _vz_sb_ = dot(_d_sb_, fwd); \
+            vec2 _sb_ = _vz_sb_ <= 0.001 ? vec2(1e10) : (vec2(dot(_d_sb_, right), dot(_d_sb_, up)) / (_vz_sb_ * fov) / vec2(aspect, 1)); \
+            if (_sa_.x < 1e9 && _sb_.x < 1e9) { \
+                vec2 _ab_ = _sb_ - _sa_; \
+                vec2 _ap_ = ndcEdge - _sa_; \
+                float _t_ = clamp(dot(_ap_, _ab_) / dot(_ab_, _ab_), 0.0, 1.0); \
+                bestDist = min(bestDist, length(ndcEdge - (_sa_ + _t_ * _ab_))); \
+            } \
         }
 
-        vec3 sndc[8];
-        bool allValid = true;
-        for (int i = 0; i < 8; i++) {
-            vec3 dir = corners[i] - ro;
-            float vz = dot(dir, fwd);
-            if (vz <= 0.001f) { allValid = false; break; }
-            float vx = dot(dir, right);
-            float vy = dot(dir, up);
-            vec2 s = vec2(vx, vy) / (vz * fov);
-            s.x /= aspect;
-            sndc[i] = vec3(s, 1.0f);
+        #define RING(segs, body) \
+            for (int _ri_ = 0; _ri_ < (segs); _ri_++) { \
+                float _a1_ = 6.283185 * float(_ri_) / float(segs); \
+                float _a2_ = 6.283185 * float(_ri_ + 1) / float(segs); \
+                { body } \
+            }
+
+        int giType = int(gType);
+        if (giType == 0) { // Box
+            vec3 he = vec3(gP1);
+            vec3 c[8];
+            for (int i = 0; i < 8; i++) {
+                float bx = float(i & 1) * 2.0 - 1.0;
+                float by = float((i >> 1) & 1) * 2.0 - 1.0;
+                float bz = float((i >> 2) & 1) * 2.0 - 1.0;
+                c[i] = gp + he * vec3(bx, by, bz);
+            }
+            EDGE_SEG(c[0], c[1]); EDGE_SEG(c[1], c[3]);
+            EDGE_SEG(c[3], c[2]); EDGE_SEG(c[2], c[0]);
+            EDGE_SEG(c[4], c[5]); EDGE_SEG(c[5], c[7]);
+            EDGE_SEG(c[7], c[6]); EDGE_SEG(c[6], c[4]);
+            EDGE_SEG(c[0], c[4]); EDGE_SEG(c[1], c[5]);
+            EDGE_SEG(c[2], c[6]); EDGE_SEG(c[3], c[7]);
+        } else if (giType == 1) { // Sphere
+            float r = gP1;
+            RING(20, { vec3 p1 = vec3(cos(_a1_)*r, sin(_a1_)*r, 0); vec3 p2 = vec3(cos(_a2_)*r, sin(_a2_)*r, 0); EDGE_SEG(gp+p1, gp+p2); })
+            RING(20, { vec3 p1 = vec3(cos(_a1_)*r, 0, sin(_a1_)*r); vec3 p2 = vec3(cos(_a2_)*r, 0, sin(_a2_)*r); EDGE_SEG(gp+p1, gp+p2); })
+            RING(20, { vec3 p1 = vec3(0, cos(_a1_)*r, sin(_a1_)*r); vec3 p2 = vec3(0, cos(_a2_)*r, sin(_a2_)*r); EDGE_SEG(gp+p1, gp+p2); })
+        } else if (giType == 2) { // Donut
+            float R = gP1, r = gP2;
+            RING(24, { vec3 p1 = vec3(cos(_a1_)*R, 0, sin(_a1_)*R); vec3 p2 = vec3(cos(_a2_)*R, 0, sin(_a2_)*R); EDGE_SEG(gp+p1, gp+p2); })
+            for (int ri = 0; ri < 4; ri++) {
+                float angle = 6.283185 * float(ri) / 4.0;
+                vec3 dir = vec3(cos(angle), 0, sin(angle));
+                vec3 center = dir * R;
+                vec3 upDir = vec3(0, 1, 0); vec3 radDir = dir;
+                RING(12, { vec3 p1 = center + r * (cos(_a1_)*radDir + sin(_a1_)*upDir); vec3 p2 = center + r * (cos(_a2_)*radDir + sin(_a2_)*upDir); EDGE_SEG(gp+p1, gp+p2); })
+            }
+        } else if (giType == 3) { // Cylinder
+            float hh = gP1, rr = gP2;
+            RING(20, { vec3 p1 = vec3(cos(_a1_)*rr, hh, sin(_a1_)*rr); vec3 p2 = vec3(cos(_a2_)*rr, hh, sin(_a2_)*rr); EDGE_SEG(gp+p1, gp+p2); })
+            RING(20, { vec3 p1 = vec3(cos(_a1_)*rr, -hh, sin(_a1_)*rr); vec3 p2 = vec3(cos(_a2_)*rr, -hh, sin(_a2_)*rr); EDGE_SEG(gp+p1, gp+p2); })
+            for (int i = 0; i < 4; i++) { float a = 6.283185 * float(i) / 4.0; vec3 base = vec3(cos(a)*rr, -hh, sin(a)*rr); vec3 top = base + vec3(0, 2*hh, 0); EDGE_SEG(gp+base, gp+top); }
+        } else if (giType == 4) { // Pyramid (cone)
+            float hh = gP1, rr = gP2;
+            RING(16, { vec3 p1 = vec3(cos(_a1_)*rr, -hh, sin(_a1_)*rr); vec3 p2 = vec3(cos(_a2_)*rr, -hh, sin(_a2_)*rr); EDGE_SEG(gp+p1, gp+p2); })
+            vec3 tipOff = vec3(0, hh, 0);
+            for (int i = 0; i < 16; i += 4) { float a = 6.283185 * float(i) / 16.0; vec3 base = vec3(cos(a)*rr, -hh, sin(a)*rr); EDGE_SEG(gp+base, gp+tipOff); }
         }
 
-        if (allValid) {
-            float lineW = 0.006f;
-            vec2 pn = ndcEdge;
-            float bestDist = 1e10f;
+        #undef RING
+        #undef EDGE_SEG
+        #undef PROJ
 
-            // 12 edges of the box, unrolled
-            #define EDGE(ai, bi) { vec2 a=sndc[ai].xy; vec2 b=sndc[bi].xy; vec2 ab=b-a; vec2 ap=pn-a; float t=clamp(dot(ap,ab)/dot(ab,ab),0.0,1.0); bestDist=min(bestDist,length(pn-(a+t*ab))); }
-            EDGE(0,1); EDGE(1,3); EDGE(3,2); EDGE(2,0);
-            EDGE(4,5); EDGE(5,7); EDGE(7,6); EDGE(6,4);
-            EDGE(0,4); EDGE(1,5); EDGE(2,6); EDGE(3,7);
-            #undef EDGE
+        float lineAlpha = 1.0 - smoothstep(0.0, lineW, bestDist);
+        float glowAlpha = 1.0 - smoothstep(0.0, lineW * 5.0, bestDist);
+        col = mix(col, ghostCol, lineAlpha * 0.9);
+        col += ghostCol * glowAlpha * 0.15;
+    }
 
-            float lineAlpha = 1.0f - smoothstep(0.0f, lineW, bestDist);
-            float glowAlpha = 1.0f - smoothstep(0.0f, lineW * 3.0f, bestDist);
-            vec3 ghostCol = (ubo.editorMode == 1) ? vec3(0.0f, 1.0f, 1.0f) : vec3(1.0f, 0.2f, 0.2f);
-            col = mix(col, ghostCol, lineAlpha * 0.9f);
-            col += ghostCol * glowAlpha * 0.1f;
+    // ── Shape-aware outline (green) for ALL selected objects ──
+    {
+        vec3 outColor = vec3(0.15, 0.95, 0.15);
+        float lineW = 0.004f;
+        float glowW = lineW * 4.0f;
+
+        #define EDGE_SEG(wa, wb) { \
+            vec3 _d_sa_ = (wa) - ro; \
+            float _vz_sa_ = dot(_d_sa_, fwd); \
+            vec2 _sa_ = _vz_sa_ <= 0.001 ? vec2(1e10) : (vec2(dot(_d_sa_, right), dot(_d_sa_, up)) / (_vz_sa_ * fov) / vec2(aspect, 1)); \
+            vec3 _d_sb_ = (wb) - ro; \
+            float _vz_sb_ = dot(_d_sb_, fwd); \
+            vec2 _sb_ = _vz_sb_ <= 0.001 ? vec2(1e10) : (vec2(dot(_d_sb_, right), dot(_d_sb_, up)) / (_vz_sb_ * fov) / vec2(aspect, 1)); \
+            if (_sa_.x < 1e9 && _sb_.x < 1e9) { \
+                vec2 _ab_ = _sb_ - _sa_; \
+                vec2 _ap_ = ndcEdge - _sa_; \
+                float _t_ = clamp(dot(_ap_, _ab_) / dot(_ab_, _ab_), 0.0, 1.0); \
+                bestDist = min(bestDist, length(ndcEdge - (_sa_ + _t_ * _ab_))); \
+            } \
+        }
+
+        #define RING(segs, body) \
+            for (int _ri_ = 0; _ri_ < (segs); _ri_++) { \
+                float _a1_ = 6.283185 * float(_ri_) / float(segs); \
+                float _a2_ = 6.283185 * float(_ri_ + 1) / float(segs); \
+                { body } \
+            }
+
+        #define DRAW_SELECTED(gc, pType, pa1, pa2) \
+            { \
+                int _iType_ = int(pType); \
+                if (_iType_ == 0) { \
+                    vec3 he = vec3(pa1); \
+                    vec3 c[8]; \
+                    for (int i = 0; i < 8; i++) { \
+                        float bx = float(i & 1) * 2.0 - 1.0; \
+                        float by = float((i >> 1) & 1) * 2.0 - 1.0; \
+                        float bz = float((i >> 2) & 1) * 2.0 - 1.0; \
+                        c[i] = gc + he * vec3(bx, by, bz); \
+                    } \
+                    EDGE_SEG(c[0], c[1]); EDGE_SEG(c[1], c[3]); \
+                    EDGE_SEG(c[3], c[2]); EDGE_SEG(c[2], c[0]); \
+                    EDGE_SEG(c[4], c[5]); EDGE_SEG(c[5], c[7]); \
+                    EDGE_SEG(c[7], c[6]); EDGE_SEG(c[6], c[4]); \
+                    EDGE_SEG(c[0], c[4]); EDGE_SEG(c[1], c[5]); \
+                    EDGE_SEG(c[2], c[6]); EDGE_SEG(c[3], c[7]); \
+                } else if (_iType_ == 1) { \
+                    float _r_ = pa1; \
+                    RING(20, { vec3 p1 = vec3(cos(_a1_)*_r_, sin(_a1_)*_r_, 0); vec3 p2 = vec3(cos(_a2_)*_r_, sin(_a2_)*_r_, 0); EDGE_SEG(gc+p1, gc+p2); }) \
+                    RING(20, { vec3 p1 = vec3(cos(_a1_)*_r_, 0, sin(_a1_)*_r_); vec3 p2 = vec3(cos(_a2_)*_r_, 0, sin(_a2_)*_r_); EDGE_SEG(gc+p1, gc+p2); }) \
+                    RING(20, { vec3 p1 = vec3(0, cos(_a1_)*_r_, sin(_a1_)*_r_); vec3 p2 = vec3(0, cos(_a2_)*_r_, sin(_a2_)*_r_); EDGE_SEG(gc+p1, gc+p2); }) \
+                } else if (_iType_ == 2) { \
+                    float _R_ = pa1, _r_ = pa2; \
+                    RING(24, { vec3 p1 = vec3(cos(_a1_)*_R_, 0, sin(_a1_)*_R_); vec3 p2 = vec3(cos(_a2_)*_R_, 0, sin(_a2_)*_R_); EDGE_SEG(gc+p1, gc+p2); }) \
+                    for (int _ri_ = 0; _ri_ < 4; _ri_++) { \
+                        float _angle_ = 6.283185 * float(_ri_) / 4.0; \
+                        vec3 _dir_ = vec3(cos(_angle_), 0, sin(_angle_)); \
+                        vec3 _center_ = _dir_ * _R_; \
+                        vec3 _upDir_ = vec3(0, 1, 0); vec3 _radDir_ = _dir_; \
+                        RING(12, { vec3 _p1_ = _center_ + _r_ * (cos(_a1_)*_radDir_ + sin(_a1_)*_upDir_); vec3 _p2_ = _center_ + _r_ * (cos(_a2_)*_radDir_ + sin(_a2_)*_upDir_); EDGE_SEG(gc+_p1_, gc+_p2_); }) \
+                    } \
+                } else if (_iType_ == 3) { \
+                    float _hh_ = pa1, _rr_ = pa2; \
+                    RING(20, { vec3 p1 = vec3(cos(_a1_)*_rr_, _hh_, sin(_a1_)*_rr_); vec3 p2 = vec3(cos(_a2_)*_rr_, _hh_, sin(_a2_)*_rr_); EDGE_SEG(gc+p1, gc+p2); }) \
+                    RING(20, { vec3 p1 = vec3(cos(_a1_)*_rr_, -_hh_, sin(_a1_)*_rr_); vec3 p2 = vec3(cos(_a2_)*_rr_, -_hh_, sin(_a2_)*_rr_); EDGE_SEG(gc+p1, gc+p2); }) \
+                    for (int _i_ = 0; _i_ < 4; _i_++) { float _a_ = 6.283185 * float(_i_) / 4.0; vec3 _base_ = vec3(cos(_a_)*_rr_, -_hh_, sin(_a_)*_rr_); vec3 _top_ = _base_ + vec3(0, 2*_hh_, 0); EDGE_SEG(gc+_base_, gc+_top_); } \
+                } else if (_iType_ == 4) { \
+                    float _hh_ = pa1, _rr_ = pa2; \
+                    RING(16, { vec3 p1 = vec3(cos(_a1_)*_rr_, -_hh_, sin(_a1_)*_rr_); vec3 p2 = vec3(cos(_a2_)*_rr_, -_hh_, sin(_a2_)*_rr_); EDGE_SEG(gc+p1, gc+p2); }) \
+                    vec3 _tipOff_ = vec3(0, _hh_, 0); \
+                    for (int _i_ = 0; _i_ < 16; _i_ += 4) { float _a_ = 6.283185 * float(_i_) / 16.0; vec3 _base_ = vec3(cos(_a_)*_rr_, -_hh_, sin(_a_)*_rr_); EDGE_SEG(gc+_base_, gc+_tipOff_); } \
+                } \
+            }
+
+        // Outline for primary selection
+        float bestDist = 1e10f;
+        if (ubo.selectedValid > 0.5f) {
+            DRAW_SELECTED(ubo.selectedPos, ubo.selectedPrimInfo.x, ubo.selectedPrimInfo.y, ubo.selectedPrimInfo.z);
+        }
+
+        // Outline for additional multi-selected objects
+        for (int _si_ = 0; _si_ < 32; _si_++) {
+            if (ubo.selPos[_si_].w > 0.5f) {
+                DRAW_SELECTED(ubo.selPos[_si_].xyz, ubo.selInfo[_si_].x, ubo.selInfo[_si_].y, ubo.selInfo[_si_].z);
+            }
+        }
+
+        #undef DRAW_SELECTED
+        #undef RING
+        #undef EDGE_SEG
+
+        float lineAlpha = 1.0 - smoothstep(0.0, lineW, bestDist);
+        float glowAlpha = 1.0 - smoothstep(0.0, glowW, bestDist);
+        col = mix(col, outColor, lineAlpha * 0.9);
+        col += outColor * glowAlpha * 0.15;
+    }
+
+    // ── Gizmo cones (Move tool only, primary selection) ─────
+    if (ubo.selectedPrimInfo.w > 0.5f && ubo.selectedValid > 0.5f) {
+        vec3 gc = ubo.selectedPos;
+        float gLen = 0.6f;
+        float coneH = 0.15f;
+        float coneR = 0.06f;
+        float edgeW = 0.005f;
+        vec3 gAxes[3] = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
+        vec3 gCols[3] = { vec3(1,0.2,0.2), vec3(0.2,1,0.2), vec3(0.2,0.2,1) };
+        vec3 lightDir = normalize(vec3(1.0, 2.0, 1.0));
+        for (int ai = 0; ai < 3; ai++) {
+            vec3 basePos = gc + gAxes[ai] * gLen;
+            vec3 apexPos = gc + gAxes[ai] * (gLen + coneH);
+
+            // ── Screen-space triangle for silhouette test ──
+            vec3 db = basePos - ro;
+            float vzb = dot(db, fwd);
+            if (vzb <= 0.001) continue;
+            vec2 sBase = vec2(dot(db, right), dot(db, up)) / (vzb * fov);
+            sBase.x /= aspect;
+
+            vec3 da = apexPos - ro;
+            float vza = dot(da, fwd);
+            if (vza <= 0.001) continue;
+            vec2 sApex = vec2(dot(da, right), dot(da, up)) / (vza * fov);
+            sApex.x /= aspect;
+
+            vec2 dirNDC = sApex - sBase;
+            float dirLen = length(dirNDC);
+            if (dirLen < 0.001) continue;
+            dirNDC /= dirLen;
+            vec2 perp = vec2(-dirNDC.y, dirNDC.x);
+            float baseW = coneR / (vzb * fov);
+
+            vec2 v0 = sApex, v1 = sBase + perp * baseW, v2 = sBase - perp * baseW;
+            float s0 = (v1.x - v0.x) * (ndcEdge.y - v0.y) - (v1.y - v0.y) * (ndcEdge.x - v0.x);
+            float s1 = (v2.x - v1.x) * (ndcEdge.y - v1.y) - (v2.y - v1.y) * (ndcEdge.x - v1.x);
+            float s2 = (v0.x - v2.x) * (ndcEdge.y - v2.y) - (v0.y - v2.y) * (ndcEdge.x - v2.x);
+            bool insideTri = (s0 >= 0.0 && s1 >= 0.0 && s2 >= 0.0) ||
+                             (s0 <= 0.0 && s1 <= 0.0 && s2 <= 0.0);
+            if (!insideTri) continue;
+
+            float edgeDist = min(min(abs(s0) / length(v1 - v0),
+                                     abs(s1) / length(v2 - v1)),
+                                 abs(s2) / length(v0 - v2));
+
+            // ── 3D ray-cone intersection ──
+            vec3 localY = -gAxes[ai];
+            vec3 localX = normalize(cross(abs(localY.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0), localY));
+            vec3 localZ = cross(localY, localX);
+
+            vec3 roL = vec3(dot(ro - apexPos, localX),
+                            dot(ro - apexPos, localY),
+                            dot(ro - apexPos, localZ));
+            vec3 rdL = vec3(dot(rd, localX), dot(rd, localY), dot(rd, localZ));
+
+            float k = coneR / coneH;
+            float k2 = k * k;
+            float A = rdL.x*rdL.x + rdL.z*rdL.z - k2*rdL.y*rdL.y;
+            float B = 2.0*(roL.x*rdL.x + roL.z*rdL.z - k2*roL.y*rdL.y);
+            float C = roL.x*roL.x + roL.z*roL.z - k2*roL.y*roL.y;
+            float disc = B*B - 4.0*A*C;
+            if (disc < 0.0) continue;
+
+            float sqrtDisc = sqrt(disc);
+            float tHit = 1e10;
+            bool hitCap = false;
+
+            for (int ti = 0; ti < 2; ti++) {
+                float t = (ti == 0) ? (-B - sqrtDisc) / (2.0*A)
+                                    : (-B + sqrtDisc) / (2.0*A);
+                if (t > 0.001) {
+                    vec3 pL = roL + rdL * t;
+                    if (pL.y >= 0.0 && pL.y <= coneH) {
+                        tHit = t;
+                        break;
+                    }
+                }
+            }
+
+            if (tHit > 1e9 && abs(rdL.y) > 1e-8) {
+                float tCap = (coneH - roL.y) / rdL.y;
+                if (tCap > 0.001) {
+                    vec3 pCap = roL + rdL * tCap;
+                    if (pCap.x*pCap.x + pCap.z*pCap.z <= coneR*coneR) {
+                        tHit = tCap;
+                        hitCap = true;
+                    }
+                }
+            }
+
+            if (tHit > 1e9) continue;
+
+            // ── Normal and lighting ──
+            vec3 nL;
+            if (hitCap) {
+                nL = vec3(0.0, 1.0, 0.0);
+            } else {
+                vec3 pHit = roL + rdL * tHit;
+                nL = normalize(vec3(pHit.x, -k2 * pHit.y, pHit.z));
+            }
+
+            vec3 norm = nL.x*localX + nL.y*localY + nL.z*localZ;
+            float diff = max(dot(norm, lightDir), 0.0);
+            float lum = 0.3 + diff * 0.7;
+
+            vec3 coneCol = gCols[ai] * lum;
+            float coneAlpha = smoothstep(-edgeW, edgeW, edgeDist);
+            col = mix(col, coneCol, coneAlpha);
         }
     }
 

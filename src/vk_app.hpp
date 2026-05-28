@@ -4,21 +4,39 @@
 #include <volk.h>
 
 #include <array>
+#include <bitset>
 #include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-enum class EditorMode {
-    Navigate,
-    AddWall,
-    AddVoid
+enum class PrimType {
+    Box = 0,
+    Sphere = 1,
+    Donut = 2,
+    Cylinder = 3,
+    Pyramid = 4
+};
+
+enum class ToolType {
+    Select,   // click to select, green highlight
+    Marquee,  // drag marquee to select
+    Move,     // click-drag to move
+    Box, Sphere, Donut, Cylinder, Pyramid  // placement tools
+};
+
+enum class OpType {
+    Union = 0,
+    Subtract = 1,
+    Intersect = 2
 };
 
 struct PlacedObject {
-    float type;       // 0 = wall, 1 = void
-    float sx, sy, sz; // half-extents
-    float px, py, pz, pw; // position (pw unused)
+    float type;       // 0 = additive, 1 = subtractive
+    float primType;   // 0=Box, 1=Sphere, 2=Donut, 3=Cylinder, 4=Pyramid
+    float param1;     // shape-specific param (box-half-extent, sphere-r, donut-R, cyl-h, pyr-h)
+    float param2;     // shape-specific param (box-half-extent-z, donut-r, cyl-r, pyr-r)
+    float px, py, pz, hidden; // position + hidden flag
 };
 
 static constexpr int MAX_OBJECTS = 256;
@@ -37,14 +55,41 @@ private:
     std::chrono::steady_clock::time_point startTime_;
 
     // Editor state
-    EditorMode mode_ = EditorMode::Navigate;
+    ToolType activeTool_ = ToolType::Select;
+    bool addAsVoid_ = false;    // true to place subtractive (void)
+    bool snapEnabled_ = false;  // snap to half-grid when placing
     std::vector<PlacedObject> placedObjects_;
     bool lastLeftDown_ = false;
     int  clickStartX_ = 0, clickStartY_ = 0;
 
+    // Selection
+    int  selectedIndex_ = -1;
+    std::vector<int> selectedIndices_;
+
+    // Marquee select state
+    bool marqueeActive_ = false;
+    int  marqueeStartX_ = 0, marqueeStartY_ = 0;
+    int  marqueeEndX_ = 0, marqueeEndY_ = 0;
+
+    // Boolean operation
+    OpType opType_ = OpType::Union;
+
+    // Hidden objects (bitset)
+    std::bitset<MAX_OBJECTS> hiddenFlags_;
+
     // Ghost preview (CPU ray-march result, synced with GPU)
     float ghostPosX_ = 0.0f, ghostPosY_ = 0.0f, ghostPosZ_ = 0.0f;
     bool ghostValid_ = false;
+    int  ghostMouseX_ = -1, ghostMouseY_ = -1;
+    ToolType ghostTool_ = ToolType::Select;
+    bool ghostVoid_ = false;
+
+    // Selection & gizmo move
+    int  gizmoAxis_ = 0;  // 0=none, 1=X, 2=Y, 3=Z
+    bool isDragging_ = false;
+    int  dragStartSX_ = 0, dragStartSY_ = 0;
+    float dragObjX_ = 0, dragObjY_ = 0, dragObjZ_ = 0;
+    std::vector<float> dragOrigX_, dragOrigY_, dragOrigZ_; // per-object start positions (multi)
 
     // Vulkan core
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -63,11 +108,13 @@ private:
 
     // Pipeline
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
+    VkRenderPass imguiRenderPass_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
 
     // Descriptors
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
+    VkDescriptorPool imguiDescPool_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout descSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSet descSet_ = VK_NULL_HANDLE;
 
@@ -108,6 +155,18 @@ private:
         alignas(16) std::array<float, 4> cameraPos;
         alignas(16) std::array<float, 4> cameraTarget;
         alignas(16) std::array<float, 4> ghostPos; // xyz = position, w = valid flag
+        alignas(16) std::array<float, 4> ghostPrimInfo; // x=primType, y=param1, z=param2, w=unused
+        alignas(16) std::array<float, 4> selectedPos; // xyz = position, w = valid flag
+        alignas(16) std::array<float, 4> selectedPrimInfo; // x=primType, y=param1, z=param2, w=showGizmo
+        alignas(16) std::array<float, 4> camRight;    // camera right direction
+        alignas(16) std::array<float, 4> camUp;       // camera up direction
+        alignas(16) std::array<uint32_t, 8> hiddenFlags; // bitset for 256 objects
+
+        // Multi-selection highlight
+        int32_t selectedCount;
+        float _padMsel[3];
+        alignas(16) std::array<float, 4> selPos[32];
+        alignas(16) std::array<float, 4> selInfo[32];
     };
 
     // Init helpers
@@ -137,11 +196,20 @@ private:
     void recordCommandBuffer(Frame& frame, uint32_t imageIndex);
     void updateUniforms();
     void handleInput();
-    void placeObject(int screenX, int screenY);
+    void placeObject();
+    static float cpuSDF(const std::array<float, 3>& p, const PlacedObject& obj);
     bool cpuRayMarch(int screenX, int screenY, float& hx, float& hy, float& hz);
+    int  pickObject(int screenX, int screenY);
+    int  gizmoHitTest(int screenX, int screenY);
+    void startGizmoDrag(int screenX, int screenY);
+    void doGizmoDrag(int screenX, int screenY);
+    void executeBooleanOp();
     void updateTitle();
     void updateObjectBuffer();
     void drawFrame();
+
+    void initImgui();
+    void renderImgui();
 
     uint32_t findMemoryType(uint32_t filter, VkMemoryPropertyFlags props);
 };

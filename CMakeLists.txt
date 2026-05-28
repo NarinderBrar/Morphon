@@ -43,6 +43,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(volk)
 
+# ─── Dear ImGui ──────────────────────────────────────────────────────────
+FetchContent_Declare(
+  imgui
+  GIT_REPOSITORY https://github.com/ocornut/imgui.git
+  GIT_TAG v1.91.8
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(imgui)
+
 # ─── Shader sources dependency marker ────────────────────────────────────
 file(GLOB_RECURSE SHADER_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.vert
@@ -56,9 +65,17 @@ add_executable(Morphon
   src/main.cpp
   src/vk_app.cpp
   src/win32_window.cpp
+  ${imgui_SOURCE_DIR}/imgui.cpp
+  ${imgui_SOURCE_DIR}/imgui_draw.cpp
+  ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+  ${imgui_SOURCE_DIR}/imgui_tables.cpp
+  ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+  ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
 target_compile_definitions(Morphon PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+target_compile_definitions(Morphon PRIVATE IMGUI_IMPL_VULKAN_USE_VOLK)
+target_compile_definitions(Morphon PRIVATE "IMGUI_USER_CONFIG=\"imgui_config.h\"")
 
 target_link_libraries(Morphon PRIVATE
   Vulkan::Headers
@@ -73,6 +90,8 @@ target_include_directories(Morphon PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${glslang_SOURCE_DIR}
   ${glslang_SOURCE_DIR}/SPIRV
+  ${imgui_SOURCE_DIR}
+  ${imgui_SOURCE_DIR}/backends
 )
 
 # Re-link when shaders change

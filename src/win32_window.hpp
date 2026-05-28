@@ -38,6 +38,8 @@ public:
     VkSurfaceKHR createVulkanSurface(VkInstance instance);
     static std::vector<const char*> getVulkanExtensions();
 
+    HWND getHwnd() const { return hwnd_; }
+
 private:
     HWND   hwnd_ = nullptr;
     HINSTANCE hinstance_ = nullptr;

@@ -6,6 +6,10 @@
 #include <glslang/Public/ShaderLang.h>
 #include <SPIRV/GlslangToSpv.h>
 
+#include <imgui.h>
+#include <imgui_impl_vulkan.h>
+#include <imgui_impl_win32.h>
+
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -101,7 +105,6 @@ static const TBuiltInResource defaultResources = {
     .maxTessEvaluationTextureImageUnits = 16,
     .maxTessEvaluationUniformComponents = 1024,
     .maxTessPatchComponents = 120,
-    .maxPatchVertices = 32,
     .maxTessGenLevel = 64,
     .maxViewports = 16,
     .maxVertexAtomicCounters = 0,
@@ -204,6 +207,7 @@ void VulkanApp::initVulkan() {
     createCommandPool();
     createCommandBuffers();
     createSyncObjects();
+    initImgui();
 }
 
 // ── instance ─────────────────────────────────────────────────────────────
@@ -230,7 +234,6 @@ void VulkanApp::createInstance() {
 
     auto exts = Win32Window::getVulkanExtensions();
 
-    // Check which extensions are available
     uint32_t extCount;
     vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr);
     std::vector<VkExtensionProperties> availExts(extCount);
@@ -471,27 +474,37 @@ void VulkanApp::createRenderPass() {
 
     VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
 
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments    = &ref;
+    VkSubpassDescription subpasses[2]{};
+    subpasses[0].pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpasses[0].colorAttachmentCount = 1;
+    subpasses[0].pColorAttachments    = &ref;
+    subpasses[1].pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpasses[1].colorAttachmentCount = 1;
+    subpasses[1].pColorAttachments    = &ref;
 
-    VkSubpassDependency dep{};
-    dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass    = 0;
-    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.srcAccessMask = 0;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkSubpassDependency deps[2]{};
+    deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass    = 0;
+    deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].srcAccessMask = 0;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    deps[1].srcSubpass    = 0;
+    deps[1].dstSubpass    = 1;
+    deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
     VkRenderPassCreateInfo rpci{};
     rpci.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpci.attachmentCount = 1;
     rpci.pAttachments    = &color;
-    rpci.subpassCount    = 1;
-    rpci.pSubpasses      = &subpass;
-    rpci.dependencyCount = 1;
-    rpci.pDependencies   = &dep;
+    rpci.subpassCount    = 2;
+    rpci.pSubpasses      = subpasses;
+    rpci.dependencyCount = 2;
+    rpci.pDependencies   = deps;
 
     VkResult res = vkCreateRenderPass(device_, &rpci, nullptr, &renderPass_);
     if (res != VK_SUCCESS) throw std::runtime_error("Failed to create render pass");
@@ -862,6 +875,10 @@ void VulkanApp::rebuildSwapchain() {
 // ── draw frame ───────────────────────────────────────────────────────────
 
 void VulkanApp::drawFrame() {
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
     auto& frame = frames_[currentFrame_];
 
     vkWaitForFences(device_, 1, &frame.inFlight, VK_TRUE, UINT64_MAX);
@@ -936,11 +953,52 @@ void VulkanApp::recordCommandBuffer(Frame& frame, uint32_t imageIndex) {
                             pipelineLayout_, 0, 1, &descSet_, 0, nullptr);
     vkCmdDraw(frame.cmdBuffer, 3, 1, 0, 0);
 
+    vkCmdNextSubpass(frame.cmdBuffer, VK_SUBPASS_CONTENTS_INLINE);
+
+    renderImgui();
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), frame.cmdBuffer);
+
     vkCmdEndRenderPass(frame.cmdBuffer);
     vkEndCommandBuffer(frame.cmdBuffer);
 }
 
 // ── update uniforms ──────────────────────────────────────────────────────
+
+// ── Tool helpers ─────────────────────────────────────────────────────────
+
+static bool isPrimitiveTool(ToolType t) {
+    return t >= ToolType::Box;
+}
+
+static PrimType toolToPrimType(ToolType t) {
+    return static_cast<PrimType>(static_cast<int>(t) - static_cast<int>(ToolType::Box));
+}
+
+static float shapeHalfHeight(const PlacedObject& obj) {
+    int pt = static_cast<int>(obj.primType);
+    switch (pt) {
+        case 0: return obj.param1;
+        case 1: return obj.param1;
+        case 2: return obj.param2;
+        case 3: return obj.param1;
+        case 4: return obj.param1;
+        default: return 0.5f;
+    }
+}
+
+static const char* toolName(ToolType t) {
+    switch (t) {
+        case ToolType::Select:   return "Select";
+        case ToolType::Marquee:  return "Marquee";
+        case ToolType::Move:     return "Move";
+        case ToolType::Box:      return "Box";
+        case ToolType::Sphere:   return "Sphere";
+        case ToolType::Donut:    return "Donut";
+        case ToolType::Cylinder: return "Cylinder";
+        case ToolType::Pyramid:  return "Pyramid";
+        default: return "?";
+    }
+}
 
 void VulkanApp::updateUniforms() {
     auto now = std::chrono::steady_clock::now();
@@ -955,14 +1013,85 @@ void VulkanApp::updateUniforms() {
     float ndcX = (2.0f * curMouse.x / float(width_) - 1.0f) * aspect;
     float ndcY = -(2.0f * curMouse.y / float(height_) - 1.0f);
 
+    // Camera basis
+    float fdx = camTarget_[0] - (cx + camTarget_[0]);
+    float fdy = camTarget_[1] - (cy + camTarget_[1]);
+    float fdz = camTarget_[2] - (cz + camTarget_[2]);
+    float flen = std::sqrt(fdx*fdx + fdy*fdy + fdz*fdz);
+    fdx /= flen; fdy /= flen; fdz /= flen;
+    float rux = (fdy * 0.0f - fdz * 1.0f);
+    float ruy = (fdz * 0.0f - fdx * 0.0f);
+    float ruz = (fdx * 1.0f - fdy * 0.0f);
+    float rlen = std::sqrt(rux*rux + ruy*ruy + ruz*ruz);
+    if (rlen > 1e-8f) { rux /= rlen; ruy /= rlen; ruz /= rlen; }
+    float upx = ruy * fdz - ruz * fdy;
+    float upy = ruz * fdx - rux * fdz;
+    float upz = rux * fdy - ruy * fdx;
+
     UBO ubo{};
     ubo.time        = t;
     ubo.mouseNdcX   = ndcX;
     ubo.mouseNdcY   = ndcY;
-    ubo.editorMode  = static_cast<int32_t>(mode_);
+
+    bool isPlace = ::isPrimitiveTool(activeTool_);
+    ubo.editorMode  = isPlace ? (addAsVoid_ ? 2 : 1) : 0;
     ubo.cameraPos   = {cx + camTarget_[0], cy + camTarget_[1], cz + camTarget_[2], 0.0f};
     ubo.cameraTarget= {camTarget_[0], camTarget_[1], camTarget_[2], 0.0f};
-    ubo.ghostPos    = {ghostPosX_, ghostPosY_, ghostPosZ_, ghostValid_ ? 1.0f : 0.0f};
+    ubo.camRight    = {rux, ruy, ruz, 0.0f};
+    ubo.camUp       = {upx, upy, upz, 0.0f};
+
+    // Ghost with lift + shape info
+    if (ghostValid_ && isPlace) {
+        PlacedObject tmp;
+        PrimType pt = ::toolToPrimType(activeTool_);
+        tmp.primType = static_cast<float>(pt);
+        switch (pt) {
+            case PrimType::Box:      tmp.param1 = 0.5f; tmp.param2 = 0.5f; break;
+            case PrimType::Sphere:   tmp.param1 = 0.5f; tmp.param2 = 0.0f; break;
+            case PrimType::Donut:    tmp.param1 = 0.6f; tmp.param2 = 0.25f; break;
+            case PrimType::Cylinder: tmp.param1 = 0.5f; tmp.param2 = 0.35f; break;
+            case PrimType::Pyramid:  tmp.param1 = 0.6f; tmp.param2 = 0.4f; break;
+        }
+        float lift = ::shapeHalfHeight(tmp);
+        ubo.ghostPos = {ghostPosX_, ghostPosY_ + lift, ghostPosZ_, 1.0f};
+        ubo.ghostPrimInfo = {tmp.primType, tmp.param1, tmp.param2, 0.0f};
+    } else {
+        ubo.ghostPos = {0, 0, 0, 0};
+        ubo.ghostPrimInfo = {0, 0, 0, 0};
+    }
+
+    if (selectedIndex_ >= 0 && selectedIndex_ < (int)placedObjects_.size()) {
+        auto& s = placedObjects_[selectedIndex_];
+        ubo.selectedPos = {s.px, s.py, s.pz, 1.0f};
+        ubo.selectedPrimInfo = {s.primType, s.param1, s.param2,
+                                (activeTool_ == ToolType::Move) ? 1.0f : 0.0f};
+    } else {
+        ubo.selectedPos = {0,0,0,0};
+        ubo.selectedPrimInfo = {0,0,0,0};
+    }
+
+    // Multi-selection highlight data
+    int mselCount = 0;
+    for (int idx : selectedIndices_) {
+        if (idx >= 0 && idx < (int)placedObjects_.size() && mselCount < 32) {
+            auto& obj = placedObjects_[idx];
+            ubo.selPos[mselCount] = {obj.px, obj.py, obj.pz, 1.0f};
+            ubo.selInfo[mselCount] = {obj.primType, obj.param1, obj.param2, 0.0f};
+            mselCount++;
+        }
+    }
+    ubo.selectedCount = mselCount;
+
+    // Pack hidden flags into 8 uint32s
+    for (int i = 0; i < 8; i++) {
+        uint32_t word = 0;
+        for (int j = 0; j < 32; j++) {
+            int idx = i * 32 + j;
+            if (idx < MAX_OBJECTS && hiddenFlags_[idx])
+                word |= (1u << j);
+        }
+        ubo.hiddenFlags[i] = word;
+    }
 
     void* data;
     vkMapMemory(device_, uboMem_, 0, sizeof(UBO), 0, &data);
@@ -970,55 +1099,7 @@ void VulkanApp::updateUniforms() {
     vkUnmapMemory(device_, uboMem_);
 }
 
-// ── input handling ────────────────────────────────────────────────────────
-
-void VulkanApp::handleInput() {
-    // Update camera from mouse deltas
-    MouseState md = window_->consumeMouse();
-    if (md.leftDown) {
-        camTheta_ -= md.dx * 0.005f;
-        camPhi_   += md.dy * 0.005f;
-        camPhi_ = std::max(-1.5f, std::min(1.5f, camPhi_));
-    }
-    camDist_ *= (1.0f + md.scroll * 0.05f);
-    camDist_ = std::max(1.0f, std::min(50.0f, camDist_));
-
-    // Mode switching
-    if (window_->isKeyDown('1')) mode_ = EditorMode::Navigate;
-    if (window_->isKeyDown('2')) mode_ = EditorMode::AddWall;
-    if (window_->isKeyDown('3')) mode_ = EditorMode::AddVoid;
-    if (window_->isKeyDown('X') || window_->isKeyDown('x')) {
-        if (!placedObjects_.empty())
-            placedObjects_.pop_back();
-    }
-
-    updateTitle();
-
-    // Compute ghost position via CPU ray-march (synced with placement)
-    auto m = window_->getMouse();
-    ghostValid_ = cpuRayMarch(m.x, m.y, ghostPosX_, ghostPosY_, ghostPosZ_);
-    if (ghostValid_) {
-        ghostPosX_ = std::floor(ghostPosX_) + 0.5f;
-        ghostPosZ_ = std::floor(ghostPosZ_) + 0.5f;
-        ghostPosY_ = (mode_ == EditorMode::AddVoid) ? (ghostPosY_ - 0.5f) : (ghostPosY_ + 0.5f);
-    }
-
-    // Place object on left click release (only if mouse didn't move much = click, not drag)
-    if (m.leftDown && !lastLeftDown_) {
-        clickStartX_ = m.x;
-        clickStartY_ = m.y;
-    }
-    if (!m.leftDown && lastLeftDown_) {
-        int dx = m.x - clickStartX_;
-        int dy = m.y - clickStartY_;
-        if (dx * dx + dy * dy < 16 && mode_ != EditorMode::Navigate) {
-            placeObject(m.x, m.y);
-        }
-    }
-    lastLeftDown_ = m.leftDown;
-}
-
-// ── CPU SDF helpers for placement ray march ──────────────────────────────
+// ── CPU SDF helpers ──────────────────────────────────────────────────────
 
 static float cpuSdBox(const std::array<float, 3>& p, const std::array<float, 3>& b) {
     float qx = std::abs(p[0]) - b[0];
@@ -1040,63 +1121,67 @@ static float cpuSdTorus(const std::array<float, 3>& p, float r1, float r2) {
     return std::sqrt(qx*qx + p[1]*p[1]) - r2;
 }
 
-static float cpuSdOctahedron(const std::array<float, 3>& p, float s) {
-    float ax = std::abs(p[0]), ay = std::abs(p[1]), az = std::abs(p[2]);
-    return (ax + ay + az - s) * 0.57735027f;
+static float cpuSdCylinder(const std::array<float, 3>& p, float h, float r) {
+    float dx = std::sqrt(p[0]*p[0] + p[2]*p[2]) - r;
+    float dy = std::abs(p[1]) - h;
+    float outer = std::sqrt(std::max(dx, 0.0f) * std::max(dx, 0.0f) +
+                            std::max(dy, 0.0f) * std::max(dy, 0.0f));
+    float inner = std::min(std::max(dx, dy), 0.0f);
+    return outer + inner;
 }
 
-static void cpuOpRepeat(std::array<float, 3>& p, const std::array<float, 3>& c) {
-    auto round = [](float v) { return std::floor(v + 0.5f); };
-    for (int i = 0; i < 3; i++)
-        if (c[i] != 0.0f)
-            p[i] = p[i] - c[i] * round(p[i] / c[i]);
+static float cpuSdCone(const std::array<float, 3>& p, float h, float r) {
+    float qx = std::sqrt(p[0]*p[0] + p[2]*p[2]);
+    float qy = p[1];
+    float dx = qx - r * (1.0f - (qy + h) / (2.0f * h));
+    float dy = qy - h;
+    float outer = std::sqrt(std::max(dx, 0.0f) * std::max(dx, 0.0f) +
+                            std::max(dy, 0.0f) * std::max(dy, 0.0f));
+    float inner = std::min(std::max(dx, dy), 0.0f);
+    return outer + inner;
+}
+
+static float cpuSdPlane(const std::array<float, 3>& p, float h) {
+    return p[1] - h;
+}
+
+static float cpuSDF(const std::array<float, 3>& p, const PlacedObject& obj) {
+    int primType = static_cast<int>(obj.primType);
+    float p1 = obj.param1;
+    float p2 = obj.param2;
+
+    switch (primType) {
+        case 0: // Box
+            return cpuSdBox(p, {p1, p1, p1});
+        case 1: // Sphere
+            return cpuSdSphere(p, p1);
+        case 2: // Donut (torus)
+            return cpuSdTorus(p, p1, p2);
+        case 3: // Cylinder
+            return cpuSdCylinder(p, p1, p2);
+        case 4: // Pyramid (cone)
+            return cpuSdCone(p, p1, p2);
+        default:
+            return cpuSdBox(p, {0.5f, 0.5f, 0.5f});
+    }
 }
 
 static float cpuScene(const std::array<float, 3>& p, float t,
-                      const std::vector<PlacedObject>& objects) {
-    // Bouncing box
-    std::array<float, 3> bp = {p[0] + 1.8f, p[1], p[2]};
-    float bounce = std::abs(std::sin(t * 0.8f)) * 0.8f + 0.2f;
-    bp[1] -= bounce - 0.3f;
-    float box = cpuSdBox(bp, {0.5f, 0.5f, 0.5f});
+                      const std::vector<PlacedObject>& objects,
+                      const std::bitset<MAX_OBJECTS>& hiddenFlags) {
+    float ground = cpuSdPlane(p, -1.5f);
+    float d = ground;
 
-    // Rotating torus
-    std::array<float, 3> tp = {p[0] - 1.8f, p[1], p[2]};
-    float ang = t * 0.5f;
-    float ca = std::cos(ang), sa = std::sin(ang);
-    float tpx = ca * tp[0] + sa * tp[2];
-    float tpz = -sa * tp[0] + ca * tp[2];
-    float torus = cpuSdTorus({tpx, tp[1], tpz}, 0.7f, 0.3f);
-
-    // Ground
-    float ground = p[1] - (-1.5f);
-
-    // Sphere
-    std::array<float, 3> sp = p;
-    sp[1] += std::sin(std::sqrt(sp[0]*sp[0] + sp[2]*sp[2]) * 2.0f + t * 1.5f) * 0.08f;
-    float sphere = cpuSdSphere(sp, 0.8f);
-
-    // Octahedron
-    std::array<float, 3> op = p;
-    op[1] += 2.5f;
-    cpuOpRepeat(op, {2.5f, 0.0f, 2.5f});
-    op[1] += std::sin(t * 0.7f + op[0] * 2.0f + op[2] * 1.3f) * 0.2f;
-    float oct = cpuSdOctahedron(op, 0.25f);
-
-    float d = std::min(box, torus);
-    d = std::min(d, sphere);
-    d = std::min(d, ground);
-    // smooth union approximation
-    { float h = std::clamp(0.5f + 0.5f * (oct - d) / 0.1f, 0.0f, 1.0f);
-      d = std::min(oct, d) - 0.1f * h * (1.0f - h); }
-
-    // Placed objects
-    for (auto& obj : objects) {
+    for (size_t i = 0; i < objects.size(); i++) {
+        if (hiddenFlags[i]) continue;
+        auto& obj = objects[i];
         std::array<float, 3> cp = {p[0] - obj.px, p[1] - obj.py, p[2] - obj.pz};
-        float od = cpuSdBox(cp, {obj.sx, obj.sy, obj.sz});
-        if (obj.type < 0.5f)
-            d = std::min(d, od);
-        else
+        float od = cpuSDF(cp, obj);
+        if (obj.type < 0.5f) {
+            float k = 0.05f;
+            float h = std::clamp(0.5f + 0.5f * (od - d) / k, 0.0f, 1.0f);
+            d = std::min(d, od) - k * h * (1.0f - h);
+        } else
             d = std::max(d, -od);
     }
 
@@ -1135,13 +1220,13 @@ bool VulkanApp::cpuRayMarch(int screenX, int screenY, float& hx, float& hy, floa
     rdx /= rdlen; rdy /= rdlen; rdz /= rdlen;
 
     auto now = std::chrono::steady_clock::now();
-    float t = std::chrono::duration<float>(now - startTime_).count();
+    float time = std::chrono::duration<float>(now - startTime_).count();
 
     float dist = 0.0f;
     bool hit = false;
     for (int i = 0; i < 64; i++) {
         std::array<float, 3> p = {rox + rdx * dist, roy + rdy * dist, roz + rdz * dist};
-        float d = cpuScene(p, t, placedObjects_);
+        float d = cpuScene(p, time, placedObjects_, hiddenFlags_);
         if (d < 0.01f || dist > 30.0f) {
             if (d < 0.01f) hit = true;
             break;
@@ -1158,29 +1243,279 @@ bool VulkanApp::cpuRayMarch(int screenX, int screenY, float& hx, float& hy, floa
     return false;
 }
 
-void VulkanApp::placeObject(int, int) {
+void VulkanApp::placeObject() {
     if (!ghostValid_) return;
 
+    PrimType pt = toolToPrimType(activeTool_);
+
     PlacedObject obj{};
-    obj.type = (mode_ == EditorMode::AddVoid) ? 1.0f : 0.0f;
-    obj.sx = 0.5f; obj.sy = 0.5f; obj.sz = 0.5f;
+    obj.type = addAsVoid_ ? 1.0f : 0.0f;
+    obj.primType = static_cast<float>(pt);
+    obj.hidden = 0.0f;
+
+    switch (pt) {
+        case PrimType::Box:
+            obj.param1 = 0.5f; obj.param2 = 0.5f;
+            break;
+        case PrimType::Sphere:
+            obj.param1 = 0.5f; obj.param2 = 0.0f;
+            break;
+        case PrimType::Donut:
+            obj.param1 = 0.6f; obj.param2 = 0.25f;
+            break;
+        case PrimType::Cylinder:
+            obj.param1 = 0.5f; obj.param2 = 0.35f;
+            break;
+        case PrimType::Pyramid:
+            obj.param1 = 0.6f; obj.param2 = 0.4f;
+            break;
+    }
+
+    // Lift so object sits on ground instead of half-buried
     obj.px = ghostPosX_;
-    obj.py = ghostPosY_;
+    obj.py = ghostPosY_ + ::shapeHalfHeight(obj);
     obj.pz = ghostPosZ_;
-    obj.pw = 0.0f;
+
     placedObjects_.push_back(obj);
     updateObjectBuffer();
 }
 
-void VulkanApp::updateTitle() {
-    const char* modeStr = "Navigate";
-    switch (mode_) {
-        case EditorMode::Navigate: modeStr = "Navigate"; break;
-        case EditorMode::AddWall:  modeStr = "Add Wall"; break;
-        case EditorMode::AddVoid:  modeStr = "Add Void"; break;
+// ── Selection & gizmo ─────────────────────────────────────────────────────
+
+int VulkanApp::pickObject(int screenX, int screenY) {
+    float hx, hy, hz;
+    if (!cpuRayMarch(screenX, screenY, hx, hy, hz))
+        return -1;
+    for (int i = (int)placedObjects_.size() - 1; i >= 0; i--) {
+        auto& obj = placedObjects_[i];
+        std::array<float, 3> cp = {hx - obj.px, hy - obj.py, hz - obj.pz};
+        float d = ::cpuSDF(cp, obj);
+        if (d < 0.05f) return i;
     }
-    char title[128];
-    std::snprintf(title, sizeof(title), "Morphon -- SDF Ray Marching [%s] (%zu objects)", modeStr, placedObjects_.size());
+    return -1;
+}
+
+int VulkanApp::gizmoHitTest(int screenX, int screenY) {
+    if (selectedIndex_ < 0 || selectedIndex_ >= (int)placedObjects_.size())
+        return 0;
+    auto& obj = placedObjects_[selectedIndex_];
+    float aspect = float(width_) / float(height_);
+    float fov = 1.0f;
+    float gizmoLen = 0.6f;
+    float coneHeight = 0.15f;
+    float coneRadius = 0.06f;
+    float pixThreshold = 30.0f;
+    float ndcThreshold = pixThreshold * 2.0f / float(width_);
+
+    // Camera basis
+    float cx = camDist_ * std::cos(camPhi_) * std::sin(camTheta_);
+    float cy = camDist_ * std::sin(camPhi_);
+    float cz = camDist_ * std::cos(camPhi_) * std::cos(camTheta_);
+    float rox = cx + camTarget_[0], roy = cy + camTarget_[1], roz = cz + camTarget_[2];
+    float fdx = camTarget_[0] - rox, fdy = camTarget_[1] - roy, fdz = camTarget_[2] - roz;
+    float flen = std::sqrt(fdx*fdx + fdy*fdy + fdz*fdz);
+    fdx /= flen; fdy /= flen; fdz /= flen;
+    float rux = fdy * 0.0f - fdz * 1.0f;
+    float ruy = fdz * 0.0f - fdx * 0.0f;
+    float ruz = fdx * 1.0f - fdy * 0.0f;
+    float rlen = std::sqrt(rux*rux + ruy*ruy + ruz*ruz);
+    if (rlen > 1e-8f) { rux /= rlen; ruy /= rlen; ruz /= rlen; }
+    float upx = ruy * fdz - ruz * fdy;
+    float upy = ruz * fdx - rux * fdz;
+    float upz = rux * fdy - ruy * fdx;
+
+    // Projection helper
+    auto proj = [&](float px, float py, float pz, float& sx, float& sy) {
+        float vx = (px - rox) * rux + (py - roy) * ruy + (pz - roz) * ruz;
+        float vy = (px - rox) * upx + (py - roy) * upy + (pz - roz) * upz;
+        float vz = (px - rox) * fdx + (py - roy) * fdy + (pz - roz) * fdz;
+        sx = vx / (vz * fov) / aspect;
+        sy = vy / (vz * fov);
+    };
+
+    // Mouse in UV*2-1 space
+    float mmx = 2.0f * screenX / float(width_) - 1.0f;
+    float mmy = -(2.0f * screenY / float(height_) - 1.0f);
+
+    auto insideCone = [&](float ax, float ay, float az,
+                          float bx, float by, float bz,
+                          float baseW) -> bool {
+        float asx, asy, bsx, bsy;
+        proj(ax, ay, az, asx, asy);
+        proj(bx, by, bz, bsx, bsy);
+
+        float dx = asx - bsx, dy = asy - bsy;
+        float dLen = std::sqrt(dx*dx + dy*dy);
+        if (dLen < 1e-6f) return false;
+        dx /= dLen; dy /= dLen;
+        float ppx = -dy, ppy = dx;
+
+        float v0x = asx, v0y = asy;
+        float v1x = bsx + ppx * baseW, v1y = bsy + ppy * baseW;
+        float v2x = bsx - ppx * baseW, v2y = bsy - ppy * baseW;
+
+        float e0x = v1x - v0x, e0y = v1y - v0y;
+        float e1x = v2x - v1x, e1y = v2y - v1y;
+        float e2x = v0x - v2x, e2y = v0y - v2y;
+        float p0x = mmx - v0x, p0y = mmy - v0y;
+        float p1x = mmx - v1x, p1y = mmy - v1y;
+        float p2x = mmx - v2x, p2y = mmy - v2y;
+
+        float s0 = e0x * p0y - e0y * p0x;
+        float s1 = e1x * p1y - e1y * p1x;
+        float s2 = e2x * p2y - e2y * p2x;
+        bool inside = (s0 >= 0 && s1 >= 0 && s2 >= 0) ||
+                      (s0 <= 0 && s1 <= 0 && s2 <= 0);
+        if (!inside) return false;
+
+        float d0 = std::abs(s0) / std::sqrt(e0x*e0x + e0y*e0y);
+        float d1 = std::abs(s1) / std::sqrt(e1x*e1x + e1y*e1y);
+        float d2 = std::abs(s2) / std::sqrt(e2x*e2x + e2y*e2y);
+        float d = std::min(std::min(d0, d1), d2);
+        return d < ndcThreshold * 2.0f;
+    };
+
+    float axisDirs[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+    for (int a = 0; a < 3; a++) {
+        float bx = obj.px + axisDirs[a][0] * gizmoLen;
+        float by = obj.py + axisDirs[a][1] * gizmoLen;
+        float bz = obj.pz + axisDirs[a][2] * gizmoLen;
+        float ax = obj.px + axisDirs[a][0] * (gizmoLen + coneHeight);
+        float ay = obj.py + axisDirs[a][1] * (gizmoLen + coneHeight);
+        float az = obj.pz + axisDirs[a][2] * (gizmoLen + coneHeight);
+
+        float baseVz = (bx - rox) * fdx + (by - roy) * fdy + (bz - roz) * fdz;
+        float baseW = coneRadius / (baseVz * fov);
+
+        if (insideCone(ax, ay, az, bx, by, bz, baseW))
+            return a + 1;
+    }
+    return 0;
+}
+
+void VulkanApp::startGizmoDrag(int sx, int sy) {
+    dragStartSX_ = sx;
+    dragStartSY_ = sy;
+    dragOrigX_.clear();
+    dragOrigY_.clear();
+    dragOrigZ_.clear();
+    for (int idx : selectedIndices_) {
+        if (idx >= 0 && idx < (int)placedObjects_.size()) {
+            auto& obj = placedObjects_[idx];
+            dragOrigX_.push_back(obj.px);
+            dragOrigY_.push_back(obj.py);
+            dragOrigZ_.push_back(obj.pz);
+        }
+    }
+    auto& obj = placedObjects_[selectedIndex_];
+    dragObjX_ = obj.px;
+    dragObjY_ = obj.py;
+    dragObjZ_ = obj.pz;
+    isDragging_ = true;
+}
+
+void VulkanApp::doGizmoDrag(int sx, int sy) {
+    if (selectedIndex_ < 0) return;
+    float aspect = float(width_) / float(height_);
+    float fov = 1.0f;
+
+    // Camera basis
+    float cx = camDist_ * std::cos(camPhi_) * std::sin(camTheta_);
+    float cy = camDist_ * std::sin(camPhi_);
+    float cz = camDist_ * std::cos(camPhi_) * std::cos(camTheta_);
+    float rox = cx + camTarget_[0], roy = cy + camTarget_[1], roz = cz + camTarget_[2];
+    float fdx = camTarget_[0] - rox, fdy = camTarget_[1] - roy, fdz = camTarget_[2] - roz;
+    float flen = std::sqrt(fdx*fdx + fdy*fdy + fdz*fdz);
+    fdx /= flen; fdy /= flen; fdz /= flen;
+    float rux = fdy * 0.0f - fdz * 1.0f;
+    float ruy = fdz * 0.0f - fdx * 0.0f;
+    float ruz = fdx * 1.0f - fdy * 0.0f;
+    float rlen = std::sqrt(rux*rux + ruy*ruy + ruz*ruz);
+    if (rlen > 1e-8f) { rux /= rlen; ruy /= rlen; ruz /= rlen; }
+    float upx = ruy * fdz - ruz * fdy;
+    float upy = ruz * fdx - rux * fdz;
+    float upz = rux * fdy - ruy * fdx;
+
+    // Ray direction for current mouse
+    float ndcX = (2.0f * sx / float(width_) - 1.0f) * aspect;
+    float ndcY = -(2.0f * sy / float(height_) - 1.0f);
+    float rdx = fdx + rux * ndcX * fov + upx * ndcY * fov;
+    float rdy = fdy + ruy * ndcX * fov + upy * ndcY * fov;
+    float rdz = fdz + ruz * ndcX * fov + upz * ndcY * fov;
+    float rdlen = std::sqrt(rdx*rdx + rdy*rdy + rdz*rdz);
+    rdx /= rdlen; rdy /= rdlen; rdz /= rdlen;
+
+    // Plane through drag-start object center, perpendicular to camera view
+    float planeDist = (dragObjX_ - rox)*fdx + (dragObjY_ - roy)*fdy + (dragObjZ_ - roz)*fdz;
+    float t = planeDist / (rdx*fdx + rdy*fdy + rdz*fdz);
+    float ix = rox + rdx*t, iy = roy + rdy*t, iz = roz + rdz*t;
+
+    // Ray direction for drag start
+    float ndcSX = (2.0f * dragStartSX_ / float(width_) - 1.0f) * aspect;
+    float ndcSY = -(2.0f * dragStartSY_ / float(height_) - 1.0f);
+    float srdx = fdx + rux * ndcSX * fov + upx * ndcSY * fov;
+    float srdy = fdy + ruy * ndcSX * fov + upy * ndcSY * fov;
+    float srdz = fdz + ruz * ndcSX * fov + upz * ndcSY * fov;
+    float srdlen = std::sqrt(srdx*srdx + srdy*srdy + srdz*srdz);
+    srdx /= srdlen; srdy /= srdlen; srdz /= srdlen;
+    float st = planeDist / (srdx*fdx + srdy*fdy + srdz*fdz);
+    float six = rox + srdx*st, siy = roy + srdy*st, siz = roz + srdz*st;
+
+    // Movement along axis
+    float ax = 0, ay = 0, az = 0;
+    if (gizmoAxis_ == 1) { ax = 1; }
+    else if (gizmoAxis_ == 2) { ay = 1; }
+    else if (gizmoAxis_ == 3) { az = 1; }
+
+    float delta = (ix - six)*ax + (iy - siy)*ay + (iz - siz)*az;
+
+    for (size_t j = 0; j < selectedIndices_.size(); j++) {
+        int idx = selectedIndices_[j];
+        if (idx >= 0 && idx < (int)placedObjects_.size()) {
+            auto& obj = placedObjects_[idx];
+            obj.px = dragOrigX_[j] + delta * ax;
+            obj.py = dragOrigY_[j] + delta * ay;
+            obj.pz = dragOrigZ_[j] + delta * az;
+        }
+    }
+    updateObjectBuffer();
+}
+
+// ── Boolean operations ────────────────────────────────────────────────────
+
+void VulkanApp::executeBooleanOp() {
+    if (selectedIndices_.empty()) return;
+
+    for (int idx : selectedIndices_) {
+        if (idx < 0 || idx >= (int)placedObjects_.size()) continue;
+        PlacedObject& obj = placedObjects_[idx];
+
+        switch (opType_) {
+            case OpType::Union:
+            default:
+                obj.type = 0.0f; // additive
+                break;
+            case OpType::Subtract:
+                obj.type = 1.0f; // subtractive
+                break;
+            case OpType::Intersect:
+                obj.type = 1.0f; // subtractive
+                break;
+        }
+    }
+
+    selectedIndices_.clear();
+    selectedIndex_ = -1;
+    updateObjectBuffer();
+}
+
+void VulkanApp::updateTitle() {
+    const char* tn = ::toolName(activeTool_);
+    bool isPlace = ::isPrimitiveTool(activeTool_);
+    const char* stateStr = isPlace ? (addAsVoid_ ? "Adding Void" : "Adding") : tn;
+    char title[256];
+    std::snprintf(title, sizeof(title), "Morphon -- SDF [%s] (%zu objects)",
+                  stateStr, placedObjects_.size());
     window_->setTitle(title);
 }
 
@@ -1202,6 +1537,333 @@ void VulkanApp::updateObjectBuffer() {
     vkUnmapMemory(device_, objectMem_);
 }
 
+// ── input handling ────────────────────────────────────────────────────────
+
+void VulkanApp::handleInput() {
+    ImGuiIO& io = ImGui::GetIO();
+    auto m = window_->getMouse();
+    MouseState md = window_->consumeMouse();
+    if (io.WantCaptureMouse || io.WantCaptureKeyboard) return;
+
+    bool isPlace = ::isPrimitiveTool(activeTool_);
+
+    // ── Mouse down: gizmo grab (Move tool) or marquee start ───
+    if (m.leftDown && !lastLeftDown_) {
+        clickStartX_ = m.x;
+        clickStartY_ = m.y;
+
+        if (activeTool_ == ToolType::Move && selectedIndex_ >= 0) {
+            int axis = gizmoHitTest(m.x, m.y);
+            if (axis != 0) {
+                gizmoAxis_ = axis;
+                startGizmoDrag(m.x, m.y);
+            }
+        }
+        if (activeTool_ == ToolType::Marquee) {
+            marqueeActive_ = true;
+            marqueeStartX_ = m.x;
+            marqueeStartY_ = m.y;
+            marqueeEndX_ = m.x;
+            marqueeEndY_ = m.y;
+        }
+    }
+
+    // ── Update marquee while dragging ─────────────────────────
+    if (marqueeActive_ && m.leftDown) {
+        marqueeEndX_ = m.x;
+        marqueeEndY_ = m.y;
+    }
+
+    // ── Active gizmo drag ────────────────────────────────────
+    if (isDragging_ && m.leftDown) {
+        doGizmoDrag(m.x, m.y);
+    }
+
+    // Orbit camera (only when NOT placing, dragging, or marquee)
+    if (!isPlace && md.leftDown && !isDragging_ && !marqueeActive_) {
+        camTheta_ -= md.dx * 0.005f;
+        camPhi_   += md.dy * 0.005f;
+        camPhi_ = std::max(-1.5f, std::min(1.5f, camPhi_));
+    }
+    camDist_ *= (1.0f + md.scroll * 0.05f);
+    camDist_ = std::max(1.0f, std::min(50.0f, camDist_));
+
+    // Delete last object with X
+    if (window_->isKeyDown('X') || window_->isKeyDown('x')) {
+        if (!placedObjects_.empty())
+            placedObjects_.pop_back();
+        selectedIndex_ = -1;
+        selectedIndices_.clear();
+    }
+
+    // Escape: deselect + cancel placement
+    if (window_->isKeyDown(VK_ESCAPE)) {
+        selectedIndex_ = -1;
+        selectedIndices_.clear();
+        isDragging_ = false;
+        gizmoAxis_ = 0;
+        marqueeActive_ = false;
+        activeTool_ = ToolType::Select;
+    }
+
+    updateTitle();
+
+    // ── Ghost position via CPU ray-march ─────────────────────
+    bool pointerMoved = (m.x != ghostMouseX_ || m.y != ghostMouseY_);
+    bool toolChanged  = (activeTool_ != ghostTool_);
+    bool voidChanged  = (addAsVoid_ != ghostVoid_);
+    if (pointerMoved || toolChanged || voidChanged) {
+        ghostValid_ = isPlace && cpuRayMarch(m.x, m.y, ghostPosX_, ghostPosY_, ghostPosZ_);
+        if (ghostValid_ && snapEnabled_) {
+            ghostPosX_ = std::floor(ghostPosX_) + 0.5f;
+            ghostPosZ_ = std::floor(ghostPosZ_) + 0.5f;
+            ghostPosY_ = addAsVoid_ ? (ghostPosY_ - 0.5f) : (ghostPosY_ + 0.5f);
+        }
+        ghostMouseX_ = m.x;
+        ghostMouseY_ = m.y;
+        ghostTool_ = activeTool_;
+        ghostVoid_ = addAsVoid_;
+    }
+
+    // ── Mouse up ────────────────────────────────────────────
+    if (!m.leftDown && lastLeftDown_) {
+        if (isDragging_) {
+            isDragging_ = false;
+            gizmoAxis_ = 0;
+        } else if (marqueeActive_) {
+            // Finalize marquee selection
+            marqueeActive_ = false;
+            selectedIndices_.clear();
+
+            float aspect = float(width_) / float(height_);
+            float fov = 1.0f;
+
+            float cx = camDist_ * std::cos(camPhi_) * std::sin(camTheta_);
+            float cy = camDist_ * std::sin(camPhi_);
+            float cz = camDist_ * std::cos(camPhi_) * std::cos(camTheta_);
+            float rox = cx + camTarget_[0], roy = cy + camTarget_[1], roz = cz + camTarget_[2];
+            float fdx = camTarget_[0] - rox, fdy = camTarget_[1] - roy, fdz = camTarget_[2] - roz;
+            float flen = std::sqrt(fdx*fdx + fdy*fdy + fdz*fdz);
+            fdx /= flen; fdy /= flen; fdz /= flen;
+            float rux = fdy * 0.0f - fdz * 1.0f;
+            float ruy = fdz * 0.0f - fdx * 0.0f;
+            float ruz = fdx * 1.0f - fdy * 0.0f;
+            float rlen = std::sqrt(rux*rux + ruy*ruy + ruz*ruz);
+            if (rlen > 1e-8f) { rux /= rlen; ruy /= rlen; ruz /= rlen; }
+            float upx = ruy * fdz - ruz * fdy;
+            float upy = ruz * fdx - rux * fdz;
+            float upz = rux * fdy - ruy * fdx;
+
+            auto projectToScreen = [&](float wx, float wy, float wz, float& sx, float& sy) {
+                float vx = (wx - rox) * rux + (wy - roy) * ruy + (wz - roz) * ruz;
+                float vy = (wx - rox) * upx + (wy - roy) * upy + (wz - roz) * upz;
+                float vz = (wx - rox) * fdx + (wy - roy) * fdy + (wz - roz) * fdz;
+                sx = vx / (vz * fov) / aspect;
+                sy = vy / (vz * fov);
+            };
+
+            int minX = std::min(marqueeStartX_, marqueeEndX_);
+            int maxX = std::max(marqueeStartX_, marqueeEndX_);
+            int minY = std::min(marqueeStartY_, marqueeEndY_);
+            int maxY = std::max(marqueeStartY_, marqueeEndY_);
+
+            for (int i = 0; i < (int)placedObjects_.size(); i++) {
+                auto& obj = placedObjects_[i];
+                float sx, sy;
+                projectToScreen(obj.px, obj.py, obj.pz, sx, sy);
+                int px = static_cast<int>((sx + 1.0f) * 0.5f * width_);
+                int py = static_cast<int>((1.0f - sy) * 0.5f * height_);
+
+                if (px >= minX && px <= maxX && py >= minY && py <= maxY) {
+                    selectedIndices_.push_back(i);
+                }
+            }
+
+            if (!selectedIndices_.empty())
+                selectedIndex_ = selectedIndices_[0];
+            else
+                selectedIndex_ = -1;
+        } else {
+            int dx = m.x - clickStartX_;
+            int dy = m.y - clickStartY_;
+            bool wasClick = (dx * dx + dy * dy < 16);
+
+            if (wasClick) {
+                if (isPlace) {
+                    placeObject();
+                } else {
+                    int picked = pickObject(m.x, m.y);
+                    if (picked >= 0) {
+                        selectedIndices_.clear();
+                        selectedIndices_.push_back(picked);
+                        selectedIndex_ = picked;
+                    } else {
+                        selectedIndices_.clear();
+                        selectedIndex_ = -1;
+                    }
+                }
+            }
+        }
+    }
+    lastLeftDown_ = m.leftDown;
+}
+
+// ── Dear ImGui ──────────────────────────────────────────────────────────
+
+static void checkVkResult(VkResult res) {
+    if (res != VK_SUCCESS)
+        std::fprintf(stderr, "[VK ERROR] %d\n", (int)res);
+}
+
+void VulkanApp::initImgui() {
+    VkDescriptorPoolSize poolSizes[] = {
+        { VK_DESCRIPTOR_TYPE_SAMPLER, 1000 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000 },
+        { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000 }
+    };
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType  = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.flags  = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpci.maxSets = 1000;
+    dpci.poolSizeCount = (uint32_t)std::size(poolSizes);
+    dpci.pPoolSizes = poolSizes;
+    vkCreateDescriptorPool(device_, &dpci, nullptr, &imguiDescPool_);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = nullptr;
+
+    ImGui::StyleColorsDark();
+
+    ImGui_ImplWin32_Init(window_->getHwnd());
+
+    ImGui_ImplVulkan_InitInfo vii{};
+    vii.Instance        = instance_;
+    vii.PhysicalDevice  = physDev_;
+    vii.Device          = device_;
+    vii.QueueFamily     = graphicsQ_;
+    vii.Queue           = graphicsQueue_;
+    vii.DescriptorPool  = imguiDescPool_;
+    vii.RenderPass      = renderPass_;
+    vii.Subpass         = 1;
+    vii.MinImageCount   = (uint32_t)frames_.size();
+    vii.ImageCount      = (uint32_t)frames_.size();
+    vii.MSAASamples     = VK_SAMPLE_COUNT_1_BIT;
+    vii.CheckVkResultFn = checkVkResult;
+
+    if (!ImGui_ImplVulkan_Init(&vii))
+        std::fprintf(stderr, "[ERROR] ImGui_ImplVulkan_Init failed\n");
+}
+
+void VulkanApp::renderImgui() {
+    const char* primNames[] = {"Box", "Sphere", "Donut", "Cylinder", "Pyramid"};
+
+    ImGui::SetNextWindowPos(ImVec2(float(width_) - 250.0f, 20.0f), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(240.0f, float(height_) - 40.0f), ImGuiCond_Once);
+    ImGui::Begin("Tools", nullptr, ImGuiWindowFlags_NoCollapse);
+
+    // ── Tools ─────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Tools", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const float btnW = 105.0f;
+        const float btnH = 40.0f;
+
+        bool active = (activeTool_ == activeTool_); // always true, used below
+
+        auto toolBtn = [&](ToolType t, const char* label) {
+            bool isActive = (activeTool_ == t);
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%s %s", isActive ? ">" : " ", label);
+            if (ImGui::Button(buf, ImVec2(btnW, btnH))) {
+                activeTool_ = t;
+            }
+        };
+
+        toolBtn(ToolType::Select,   "Select");
+        ImGui::SameLine();
+        toolBtn(ToolType::Marquee,  "Marquee");
+        toolBtn(ToolType::Move,     "Move");
+        ImGui::SameLine();
+        toolBtn(ToolType::Box,      "Box");
+        ImGui::SameLine();
+        toolBtn(ToolType::Sphere,   "Sphere");
+        toolBtn(ToolType::Donut,    "Donut");
+        ImGui::SameLine();
+        toolBtn(ToolType::Cylinder, "Cylinder");
+        toolBtn(ToolType::Pyramid,  "Pyramid");
+
+        ImGui::Checkbox("Snap to grid", &snapEnabled_);
+        ImGui::Checkbox("Add as void (subtractive)", &addAsVoid_);
+        if (::isPrimitiveTool(activeTool_)) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0,1,1,1), "  Click canvas to place");
+        }
+    }
+
+    // ── Selected Objects ───────────────────────────────────────
+    if (!selectedIndices_.empty()) {
+        ImGui::Separator();
+        ImGui::Text("%zu selected:", selectedIndices_.size());
+        for (int idx : selectedIndices_) {
+            if (idx >= 0 && idx < (int)placedObjects_.size()) {
+                int pi = static_cast<int>(placedObjects_[idx].primType);
+                const char* pn = (pi >= 0 && pi < 5) ? primNames[pi] : "?";
+                ImGui::Text("  [%d] %s%s", idx, pn, hiddenFlags_[idx] ? " [H]" : "");
+            }
+        }
+    }
+
+    // ── Boolean Operations ────────────────────────────────────
+    if (ImGui::CollapsingHeader("Boolean Operations", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool canOp = (selectedIndices_.size() >= 1);
+
+        const char* opNames[] = {"Union", "Subtract", "Intersect"};
+        int curOp = static_cast<int>(opType_);
+        if (ImGui::BeginCombo("Operation", opNames[curOp])) {
+            for (int i = 0; i < 3; i++) {
+                if (ImGui::Selectable(opNames[i], curOp == i))
+                    opType_ = static_cast<OpType>(i);
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::Text("%zu object(s) selected", selectedIndices_.size());
+        if (ImGui::Button("Apply", ImVec2(220, 30)) && canOp) {
+            executeBooleanOp();
+        }
+        if (!canOp) {
+            ImGui::TextDisabled("Select an object first");
+        }
+    }
+
+    ImGui::Text("[debug] marquee=%d", marqueeActive_ ? 1 : 0);
+
+    ImGui::End();
+
+    if (marqueeActive_) {
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        int x1 = std::min(marqueeStartX_, marqueeEndX_);
+        int y1 = std::min(marqueeStartY_, marqueeEndY_);
+        int x2 = std::max(marqueeStartX_, marqueeEndX_);
+        int y2 = std::max(marqueeStartY_, marqueeEndY_);
+        dl->AddRectFilled(ImVec2((float)x1, (float)y1), ImVec2((float)x2, (float)y2),
+                          IM_COL32(255, 255, 255, 40));
+        dl->AddRect(ImVec2((float)x1, (float)y1), ImVec2((float)x2, (float)y2),
+                    IM_COL32(255, 255, 255, 200), 0.0f, 0, 2.0f);
+    }
+
+    ImGui::Render();
+}
+
 // ── utility ──────────────────────────────────────────────────────────────
 
 uint32_t VulkanApp::findMemoryType(uint32_t filter, VkMemoryPropertyFlags props) {
@@ -1218,6 +1880,11 @@ uint32_t VulkanApp::findMemoryType(uint32_t filter, VkMemoryPropertyFlags props)
 // ── cleanup ──────────────────────────────────────────────────────────────
 
 void VulkanApp::cleanup() {
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    vkDestroyDescriptorPool(device_, imguiDescPool_, nullptr);
+
     for (auto& f : frames_) {
         vkDestroyFence(device_, f.inFlight, nullptr);
         vkDestroySemaphore(device_, f.renderFinished, nullptr);
