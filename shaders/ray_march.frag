@@ -9,7 +9,7 @@ layout (binding = 0) uniform UBO {
     float mouseNdcY;
     int   editorMode;
     vec3  cameraPos;
-    float _pad0;
+    float mergeThreshold; // smooth-union blend radius (was _pad0)
     vec3  cameraTarget;
     float _pad1;
     vec3  ghostPos;
@@ -80,7 +80,7 @@ float opSubtract(float a, float b) { return max(a, -b); }
 float opIntersect(float a, float b) { return max(a, b); }
 
 float opSmoothUnion(float a, float b, float k) {
-    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    float h = clamp(0.5 + 0.5 * (b - a) / max(k, 0.0001), 0.0, 1.0);
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 
@@ -126,7 +126,7 @@ float scene(vec3 p) {
 
         float objDist = evalObject(p, objBuf.objects[i]);
         if (objBuf.objects[i].meta.x < 0.5f)
-            d = opUnion(d, objDist);
+            d = opSmoothUnion(d, objDist, ubo.mergeThreshold);
         else
             d = opSubtract(d, objDist);
     }

@@ -60,6 +60,7 @@ private:
     ToolType activeTool_ = ToolType::Select;
     bool addAsVoid_ = false;    // true to place subtractive (void)
     bool snapEnabled_ = false;  // snap to half-grid when placing
+    float mergeThreshold_ = 0.05f; // smooth-union blend radius
     std::vector<PlacedObject> placedObjects_;
     bool lastLeftDown_ = false;
     int  clickStartX_ = 0, clickStartY_ = 0;

@@ -1037,7 +1037,7 @@ void VulkanApp::updateUniforms() {
 
     bool isPlace = ::isPrimitiveTool(activeTool_);
     ubo.editorMode  = isPlace ? (addAsVoid_ ? 2 : 1) : 0;
-    ubo.cameraPos   = {cx + camTarget_[0], cy + camTarget_[1], cz + camTarget_[2], 0.0f};
+    ubo.cameraPos   = {cx + camTarget_[0], cy + camTarget_[1], cz + camTarget_[2], mergeThreshold_};
     ubo.cameraTarget= {camTarget_[0], camTarget_[1], camTarget_[2], 0.0f};
     ubo.camRight    = {rux, ruy, ruz, 0.0f};
     ubo.camUp       = {upx, upy, upz, 0.0f};
@@ -1170,7 +1170,8 @@ static float cpuSDF(const std::array<float, 3>& p, const PlacedObject& obj) {
 
 static float cpuScene(const std::array<float, 3>& p, float t,
                       const std::vector<PlacedObject>& objects,
-                      const std::bitset<MAX_OBJECTS>& hiddenFlags) {
+                      const std::bitset<MAX_OBJECTS>& hiddenFlags,
+                      float mergeThreshold) {
     float ground = cpuSdPlane(p, -1.5f);
     float d = ground;
 
@@ -1180,7 +1181,7 @@ static float cpuScene(const std::array<float, 3>& p, float t,
         std::array<float, 3> cp = {p[0] - obj.px, p[1] - obj.py, p[2] - obj.pz};
         float od = cpuSDF(cp, obj);
         if (obj.type < 0.5f) {
-            float k = 0.05f;
+            float k = std::max(mergeThreshold, 0.0001f);
             float h = std::clamp(0.5f + 0.5f * (od - d) / k, 0.0f, 1.0f);
             d = std::min(d, od) - k * h * (1.0f - h);
         } else
@@ -1228,7 +1229,7 @@ bool VulkanApp::cpuRayMarch(int screenX, int screenY, float& hx, float& hy, floa
     bool hit = false;
     for (int i = 0; i < 64; i++) {
         std::array<float, 3> p = {rox + rdx * dist, roy + rdy * dist, roz + rdz * dist};
-        float d = cpuScene(p, time, placedObjects_, hiddenFlags_);
+        float d = cpuScene(p, time, placedObjects_, hiddenFlags_, mergeThreshold_);
         if (d < 0.01f || dist > 30.0f) {
             if (d < 0.01f) hit = true;
             break;
@@ -1794,6 +1795,14 @@ void VulkanApp::renderImgui() {
             addAsVoid_ = !addAsVoid_;
         }
 
+        ImGui::Separator();
+        ImGui::Text("Merge"); ImGui::SameLine();
+        ImGui::PushItemWidth(100.0f);
+        ImGui::SliderFloat("##merge", &mergeThreshold_, 0.0f, 0.5f, "%.3f");
+        ImGui::PopItemWidth();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Smooth-union blend radius. Higher = shapes blend together more.");
+
         if (::isPrimitiveTool(activeTool_)) {
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0,1,1,1), "  Click canvas to place");
@@ -1874,6 +1883,17 @@ void VulkanApp::renderImgui() {
                     }
                 }
             }
+
+            ImGui::EndTabItem();
+        }
+
+        // ── Debug Tab ─────────────────────────────────────────
+        if (ImGui::BeginTabItem("Debug")) {
+            ImGui::Text("Merge Threshold");
+            ImGui::ProgressBar(mergeThreshold_ / 0.5f, ImVec2(-1, 12), "");
+            ImGui::Text("Objects: %zu", placedObjects_.size());
+            ImGui::Text("Selected: %d", (int)selectedIndices_.size());
+            ImGui::Text("Tool: %s", ::toolName(activeTool_));
 
             ImGui::EndTabItem();
         }
