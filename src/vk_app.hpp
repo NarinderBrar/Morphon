@@ -22,6 +22,8 @@ enum class ToolType {
     Select,   // click to select, green highlight
     Marquee,  // drag marquee to select
     Move,     // click-drag to move
+    Rotate,   // rotate tool (TODO)
+    Scale,    // scale tool (TODO)
     Box, Sphere, Donut, Cylinder, Pyramid  // placement tools
 };
 

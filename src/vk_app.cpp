@@ -991,6 +991,8 @@ static const char* toolName(ToolType t) {
         case ToolType::Select:   return "Select";
         case ToolType::Marquee:  return "Marquee";
         case ToolType::Move:     return "Move";
+        case ToolType::Rotate:   return "Rotate";
+        case ToolType::Scale:    return "Scale";
         case ToolType::Box:      return "Box";
         case ToolType::Sphere:   return "Sphere";
         case ToolType::Donut:    return "Donut";
@@ -1768,87 +1770,120 @@ void VulkanApp::initImgui() {
 void VulkanApp::renderImgui() {
     const char* primNames[] = {"Box", "Sphere", "Donut", "Cylinder", "Pyramid"};
 
-    ImGui::SetNextWindowPos(ImVec2(float(width_) - 250.0f, 20.0f), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(240.0f, float(height_) - 40.0f), ImGuiCond_Once);
-    ImGui::Begin("Tools", nullptr, ImGuiWindowFlags_NoCollapse);
-
-    // ── Tools ─────────────────────────────────────────────────
-    if (ImGui::CollapsingHeader("Tools", ImGuiTreeNodeFlags_DefaultOpen)) {
-        const float btnW = 105.0f;
-        const float btnH = 40.0f;
-
-        bool active = (activeTool_ == activeTool_); // always true, used below
-
-        auto toolBtn = [&](ToolType t, const char* label) {
-            bool isActive = (activeTool_ == t);
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%s %s", isActive ? ">" : " ", label);
-            if (ImGui::Button(buf, ImVec2(btnW, btnH))) {
+    // ── Top Bar ───────────────────────────────────────────────────
+    if (ImGui::BeginMainMenuBar()) {
+        auto toolItem = [&](ToolType t, const char* label) {
+            if (ImGui::MenuItem(label, nullptr, activeTool_ == t)) {
                 activeTool_ = t;
             }
         };
 
-        toolBtn(ToolType::Select,   "Select");
-        ImGui::SameLine();
-        toolBtn(ToolType::Marquee,  "Marquee");
-        toolBtn(ToolType::Move,     "Move");
-        ImGui::SameLine();
-        toolBtn(ToolType::Box,      "Box");
-        ImGui::SameLine();
-        toolBtn(ToolType::Sphere,   "Sphere");
-        toolBtn(ToolType::Donut,    "Donut");
-        ImGui::SameLine();
-        toolBtn(ToolType::Cylinder, "Cylinder");
-        toolBtn(ToolType::Pyramid,  "Pyramid");
+        toolItem(ToolType::Select,   "Select");
+        toolItem(ToolType::Marquee,  "Marquee");
+        toolItem(ToolType::Move,     "Move");
+        toolItem(ToolType::Rotate,   "Rotate");
+        toolItem(ToolType::Scale,    "Scale");
 
-        ImGui::Checkbox("Snap to grid", &snapEnabled_);
-        ImGui::Checkbox("Add as void (subtractive)", &addAsVoid_);
+        ImGui::Separator();
+
+        if (ImGui::MenuItem("Snap", nullptr, snapEnabled_)) {
+            snapEnabled_ = !snapEnabled_;
+        }
+
+        if (ImGui::MenuItem("Hole", nullptr, addAsVoid_)) {
+            addAsVoid_ = !addAsVoid_;
+        }
+
         if (::isPrimitiveTool(activeTool_)) {
-            ImGui::SameLine();
+            ImGui::Separator();
             ImGui::TextColored(ImVec4(0,1,1,1), "  Click canvas to place");
         }
+
+        ImGui::EndMainMenuBar();
     }
 
-    // ── Selected Objects ───────────────────────────────────────
-    if (!selectedIndices_.empty()) {
-        ImGui::Separator();
-        ImGui::Text("%zu selected:", selectedIndices_.size());
-        for (int idx : selectedIndices_) {
-            if (idx >= 0 && idx < (int)placedObjects_.size()) {
-                int pi = static_cast<int>(placedObjects_[idx].primType);
-                const char* pn = (pi >= 0 && pi < 5) ? primNames[pi] : "?";
-                ImGui::Text("  [%d] %s%s", idx, pn, hiddenFlags_[idx] ? " [H]" : "");
+    // ── Right Panel (tabs) ────────────────────────────────────────
+    ImGui::SetNextWindowPos(ImVec2(float(width_) - 250.0f, 20.0f), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(240.0f, float(height_) - 40.0f), ImGuiCond_Once);
+    ImGui::Begin("Panel", nullptr, ImGuiWindowFlags_NoCollapse);
+
+    if (ImGui::BeginTabBar("RightTabs")) {
+
+        // ── Primitives Tab ────────────────────────────────────
+        if (ImGui::BeginTabItem("Primitives")) {
+            const int cols = 2;
+            const float avail = ImGui::GetContentRegionAvail().x;
+            const float btnW = (avail - ImGui::GetStyle().ItemSpacing.x * (cols - 1)) / cols;
+            const float btnH = 60.0f;
+
+            struct PrimEntry { ToolType tool; const char* name; };
+            PrimEntry entries[] = {
+                {ToolType::Box,      "Box"},
+                {ToolType::Sphere,   "Sphere"},
+                {ToolType::Donut,    "Donut"},
+                {ToolType::Cylinder, "Cylinder"},
+                {ToolType::Pyramid,  "Pyramid"},
+            };
+
+            for (int i = 0; i < 5; i++) {
+                if (i % cols != 0) ImGui::SameLine();
+                bool isActive = (activeTool_ == entries[i].tool);
+                if (isActive)
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(ImGuiCol_ButtonActive));
+                if (ImGui::Button(entries[i].name, ImVec2(btnW, btnH))) {
+                    activeTool_ = entries[i].tool;
+                }
+                if (isActive)
+                    ImGui::PopStyleColor();
             }
+
+            ImGui::EndTabItem();
         }
-    }
 
-    // ── Boolean Operations ────────────────────────────────────
-    if (ImGui::CollapsingHeader("Boolean Operations", ImGuiTreeNodeFlags_DefaultOpen)) {
-        bool canOp = (selectedIndices_.size() >= 1);
+        // ── Boolean Operations Tab ────────────────────────────
+        if (ImGui::BeginTabItem("Boolean Operations")) {
+            bool canOp = (selectedIndices_.size() >= 1);
 
-        const char* opNames[] = {"Union", "Subtract", "Intersect"};
-        int curOp = static_cast<int>(opType_);
-        if (ImGui::BeginCombo("Operation", opNames[curOp])) {
-            for (int i = 0; i < 3; i++) {
-                if (ImGui::Selectable(opNames[i], curOp == i))
-                    opType_ = static_cast<OpType>(i);
+            const char* opNames[] = {"Union", "Subtract", "Intersect"};
+            int curOp = static_cast<int>(opType_);
+            if (ImGui::BeginCombo("Operation", opNames[curOp])) {
+                for (int i = 0; i < 3; i++) {
+                    if (ImGui::Selectable(opNames[i], curOp == i))
+                        opType_ = static_cast<OpType>(i);
+                }
+                ImGui::EndCombo();
             }
-            ImGui::EndCombo();
+
+            ImGui::Text("%zu object(s) selected", selectedIndices_.size());
+            if (ImGui::Button("Apply", ImVec2(-1, 30)) && canOp) {
+                executeBooleanOp();
+            }
+            if (!canOp) {
+                ImGui::TextDisabled("Select an object first");
+            }
+
+            // Selected objects list
+            if (!selectedIndices_.empty()) {
+                ImGui::Separator();
+                ImGui::Text("%zu selected:", selectedIndices_.size());
+                for (int idx : selectedIndices_) {
+                    if (idx >= 0 && idx < (int)placedObjects_.size()) {
+                        int pi = static_cast<int>(placedObjects_[idx].primType);
+                        const char* pn = (pi >= 0 && pi < 5) ? primNames[pi] : "?";
+                        ImGui::Text("  [%d] %s%s", idx, pn, hiddenFlags_[idx] ? " [H]" : "");
+                    }
+                }
+            }
+
+            ImGui::EndTabItem();
         }
 
-        ImGui::Text("%zu object(s) selected", selectedIndices_.size());
-        if (ImGui::Button("Apply", ImVec2(220, 30)) && canOp) {
-            executeBooleanOp();
-        }
-        if (!canOp) {
-            ImGui::TextDisabled("Select an object first");
-        }
+        ImGui::EndTabBar();
     }
-
-    ImGui::Text("[debug] marquee=%d", marqueeActive_ ? 1 : 0);
 
     ImGui::End();
 
+    // ── Marquee overlay ───────────────────────────────────────────
     if (marqueeActive_) {
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         int x1 = std::min(marqueeStartX_, marqueeEndX_);
