@@ -852,13 +852,13 @@ void VulkanApp::createGizmoBuffers() {
         // Side quads -> 2 tris each
         for (int i = 0; i < SEG; i++) {
             int ni = (i + 1) % SEG;
-        idx.push_back(topRing + i);
-        idx.push_back(botRing + i);
-        idx.push_back(botRing + ni);
-        idx.push_back(topRing + i);
-        idx.push_back(botRing + ni);
-        idx.push_back(topRing + ni);
-    }
+            idx.push_back(topRing + i);
+            idx.push_back(botRing + i);
+            idx.push_back(botRing + ni);
+            idx.push_back(topRing + i);
+            idx.push_back(botRing + ni);
+            idx.push_back(topRing + ni);
+        }
 
     // --- Cone (arrowhead) along +Z ---
     uint32_t coneBaseR = (uint32_t)verts.size();
@@ -1023,9 +1023,9 @@ void VulkanApp::createGizmoBuffers() {
             // -X
             { {{-h, -h, cz+h}, {-h, h, cz+h}, {-h, h, cz-h}, {-h, -h, cz-h}}, {-1,0,0} },
             // +Y
-            { {{-h, h, cz-h}, {h, h, cz-h}, {h, h, cz+h}, {-h, h, cz+h}}, {0,1,0} },
+            { {{-h, h, cz-h}, {-h, h, cz+h}, {h, h, cz+h}, {h, h, cz-h}}, {0,1,0} },
             // -Y
-            { {{-h, -h, cz+h}, {h, -h, cz+h}, {h, -h, cz-h}, {-h, -h, cz-h}}, {0,-1,0} },
+            { {{-h, -h, cz+h}, {-h, -h, cz-h}, {h, -h, cz-h}, {h, -h, cz+h}}, {0,-1,0} },
             // +Z
             { {{-h, -h, cz+h}, {h, -h, cz+h}, {h, h, cz+h}, {-h, h, cz+h}}, {0,0,1} },
             // -Z
@@ -1131,7 +1131,7 @@ void VulkanApp::createGizmoPipeline() {
     VkPipelineRasterizationStateCreateInfo rs{};
     rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode    = VK_CULL_MODE_NONE;
+    rs.cullMode    = VK_CULL_MODE_BACK_BIT;
     rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth   = 1.0f;
 
