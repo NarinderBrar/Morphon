@@ -22,12 +22,14 @@ layout (binding = 0) uniform UBO {
     float _pad2;
     vec3  camUp;
     float _pad3;
-    uint  hiddenFlags[8];
+    uvec4 hiddenFlags0;
+    uvec4 hiddenFlags1;
 
     // Multi-selection
     int   selectedCount;
     vec4  selPos[32];
     vec4  selInfo[32];
+    mat4  viewProj;
 } ubo;
 
 #define MAX_OBJECTS 256
@@ -35,6 +37,8 @@ layout (binding = 0) uniform UBO {
 struct PlacedObject {
     vec4 meta;  // x=type, y=primType, z=param1, w=param2
     vec4 pos;   // xyz=position, w=hidden
+    vec4 rot;   // xyz=rotation (Euler angles), w=unused
+    vec4 scl;   // xyz=scale factors, w=unused
 };
 
 layout (binding = 1, std430) readonly buffer ObjectBuffer {
@@ -84,6 +88,27 @@ float opSmoothUnion(float a, float b, float k) {
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 
+// ── 3D rotation helpers ───────────────────────────────────────────────────
+
+mat3 rotX(float a) {
+    float c = cos(a), s = sin(a);
+    return mat3(1, 0, 0, 0, c, -s, 0, s, c);
+}
+
+mat3 rotY(float a) {
+    float c = cos(a), s = sin(a);
+    return mat3(c, 0, s, 0, 1, 0, -s, 0, c);
+}
+
+mat3 rotZ(float a) {
+    float c = cos(a), s = sin(a);
+    return mat3(c, -s, 0, s, c, 0, 0, 0, 1);
+}
+
+mat3 eulerRotation(vec3 euler) {
+    return rotZ(euler.z) * rotY(euler.y) * rotX(euler.x);
+}
+
 // ── Object evaluator ─────────────────────────────────────────────────────
 
 float evalObject(vec3 p, PlacedObject obj) {
@@ -91,6 +116,10 @@ float evalObject(vec3 p, PlacedObject obj) {
     float p1 = obj.meta.z;
     float p2 = obj.meta.w;
     vec3 op = p - obj.pos.xyz;
+
+    // Apply scale then rotation to the query point
+    op /= obj.scl.xyz;
+    op = eulerRotation(obj.rot.xyz) * op;
 
     float d;
     if (primType == 0) { // Box
@@ -106,6 +135,9 @@ float evalObject(vec3 p, PlacedObject obj) {
     } else {
         d = sdBox(op, vec3(0.5));
     }
+
+    // Adjust distance for scale
+    d *= min(obj.scl.x, min(obj.scl.y, obj.scl.z));
     return d;
 }
 
@@ -120,7 +152,9 @@ float scene(vec3 p) {
         if (i >= objCount) break;
 
         // Skip hidden objects
-        uint word = ubo.hiddenFlags[i >> 5];
+        uint word = (i < 128)
+            ? ubo.hiddenFlags0[(i >> 5) & 3]
+            : ubo.hiddenFlags1[(i >> 5) & 3];
         uint bit = (word >> (i & 31)) & 1u;
         if (bit != 0u) continue;
 
@@ -480,118 +514,6 @@ void main() {
         float glowAlpha = 1.0 - smoothstep(0.0, glowW, bestDist);
         col = mix(col, outColor, lineAlpha * 0.9);
         col += outColor * glowAlpha * 0.15;
-    }
-
-    // ── Gizmo cones (Move tool only, primary selection) ─────
-    if (ubo.selectedPrimInfo.w > 0.5f && ubo.selectedValid > 0.5f) {
-        vec3 gc = ubo.selectedPos;
-        float gLen = 0.6f;
-        float coneH = 0.15f;
-        float coneR = 0.06f;
-        float edgeW = 0.005f;
-        vec3 gAxes[3] = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
-        vec3 gCols[3] = { vec3(1,0.2,0.2), vec3(0.2,1,0.2), vec3(0.2,0.2,1) };
-        vec3 lightDir = normalize(vec3(1.0, 2.0, 1.0));
-        for (int ai = 0; ai < 3; ai++) {
-            vec3 basePos = gc + gAxes[ai] * gLen;
-            vec3 apexPos = gc + gAxes[ai] * (gLen + coneH);
-
-            // ── Screen-space triangle for silhouette test ──
-            vec3 db = basePos - ro;
-            float vzb = dot(db, fwd);
-            if (vzb <= 0.001) continue;
-            vec2 sBase = vec2(dot(db, right), dot(db, up)) / (vzb * fov);
-            sBase.x /= aspect;
-
-            vec3 da = apexPos - ro;
-            float vza = dot(da, fwd);
-            if (vza <= 0.001) continue;
-            vec2 sApex = vec2(dot(da, right), dot(da, up)) / (vza * fov);
-            sApex.x /= aspect;
-
-            vec2 dirNDC = sApex - sBase;
-            float dirLen = length(dirNDC);
-            if (dirLen < 0.001) continue;
-            dirNDC /= dirLen;
-            vec2 perp = vec2(-dirNDC.y, dirNDC.x);
-            float baseW = coneR / (vzb * fov);
-
-            vec2 v0 = sApex, v1 = sBase + perp * baseW, v2 = sBase - perp * baseW;
-            float s0 = (v1.x - v0.x) * (ndcEdge.y - v0.y) - (v1.y - v0.y) * (ndcEdge.x - v0.x);
-            float s1 = (v2.x - v1.x) * (ndcEdge.y - v1.y) - (v2.y - v1.y) * (ndcEdge.x - v1.x);
-            float s2 = (v0.x - v2.x) * (ndcEdge.y - v2.y) - (v0.y - v2.y) * (ndcEdge.x - v2.x);
-            bool insideTri = (s0 >= 0.0 && s1 >= 0.0 && s2 >= 0.0) ||
-                             (s0 <= 0.0 && s1 <= 0.0 && s2 <= 0.0);
-            if (!insideTri) continue;
-
-            float edgeDist = min(min(abs(s0) / length(v1 - v0),
-                                     abs(s1) / length(v2 - v1)),
-                                 abs(s2) / length(v0 - v2));
-
-            // ── 3D ray-cone intersection ──
-            vec3 localY = -gAxes[ai];
-            vec3 localX = normalize(cross(abs(localY.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0), localY));
-            vec3 localZ = cross(localY, localX);
-
-            vec3 roL = vec3(dot(ro - apexPos, localX),
-                            dot(ro - apexPos, localY),
-                            dot(ro - apexPos, localZ));
-            vec3 rdL = vec3(dot(rd, localX), dot(rd, localY), dot(rd, localZ));
-
-            float k = coneR / coneH;
-            float k2 = k * k;
-            float A = rdL.x*rdL.x + rdL.z*rdL.z - k2*rdL.y*rdL.y;
-            float B = 2.0*(roL.x*rdL.x + roL.z*rdL.z - k2*roL.y*rdL.y);
-            float C = roL.x*roL.x + roL.z*roL.z - k2*roL.y*roL.y;
-            float disc = B*B - 4.0*A*C;
-            if (disc < 0.0) continue;
-
-            float sqrtDisc = sqrt(disc);
-            float tHit = 1e10;
-            bool hitCap = false;
-
-            for (int ti = 0; ti < 2; ti++) {
-                float t = (ti == 0) ? (-B - sqrtDisc) / (2.0*A)
-                                    : (-B + sqrtDisc) / (2.0*A);
-                if (t > 0.001) {
-                    vec3 pL = roL + rdL * t;
-                    if (pL.y >= 0.0 && pL.y <= coneH) {
-                        tHit = t;
-                        break;
-                    }
-                }
-            }
-
-            if (tHit > 1e9 && abs(rdL.y) > 1e-8) {
-                float tCap = (coneH - roL.y) / rdL.y;
-                if (tCap > 0.001) {
-                    vec3 pCap = roL + rdL * tCap;
-                    if (pCap.x*pCap.x + pCap.z*pCap.z <= coneR*coneR) {
-                        tHit = tCap;
-                        hitCap = true;
-                    }
-                }
-            }
-
-            if (tHit > 1e9) continue;
-
-            // ── Normal and lighting ──
-            vec3 nL;
-            if (hitCap) {
-                nL = vec3(0.0, 1.0, 0.0);
-            } else {
-                vec3 pHit = roL + rdL * tHit;
-                nL = normalize(vec3(pHit.x, -k2 * pHit.y, pHit.z));
-            }
-
-            vec3 norm = nL.x*localX + nL.y*localY + nL.z*localZ;
-            float diff = max(dot(norm, lightDir), 0.0);
-            float lum = 0.3 + diff * 0.7;
-
-            vec3 coneCol = gCols[ai] * lum;
-            float coneAlpha = smoothstep(-edgeW, edgeW, edgeDist);
-            col = mix(col, coneCol, coneAlpha);
-        }
     }
 
     // Vignette

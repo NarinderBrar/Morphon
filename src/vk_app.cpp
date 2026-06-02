@@ -10,6 +10,8 @@
 #include <imgui_impl_vulkan.h>
 #include <imgui_impl_win32.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -203,6 +205,8 @@ void VulkanApp::initVulkan() {
     createUniformBuffer();
     createObjectBuffer();
     createPipeline();
+    createGizmoBuffers();
+    createGizmoPipeline();
     createFramebuffers();
     createCommandPool();
     createCommandBuffers();
@@ -779,6 +783,474 @@ void VulkanApp::createPipeline() {
     vkDestroyShaderModule(device_, vertMod, nullptr);
 }
 
+// ── gizmo vertex/index buffer helpers ────────────────────────────────────
+
+struct GizmoVertex {
+    float pos[3];
+    float normal[3];
+};
+
+void VulkanApp::createGizmoBuffers() {
+    auto createDevBuf = [&](VkDeviceSize sz, const void* data,
+                            VkBufferUsageFlags usage,
+                            VkBuffer& buf, VkDeviceMemory& mem) {
+        VkBufferCreateInfo bci{};
+        bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size        = sz;
+        bci.usage       = usage;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkResult res = vkCreateBuffer(device_, &bci, nullptr, &buf);
+        if (res != VK_SUCCESS) throw std::runtime_error("Failed to create gizmo buffer");
+
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(device_, buf, &mr);
+
+        VkMemoryAllocateInfo mai{};
+        mai.sType          = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = findMemoryType(mr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        res = vkAllocateMemory(device_, &mai, nullptr, &mem);
+        if (res != VK_SUCCESS) throw std::runtime_error("Failed to alloc gizmo buffer mem");
+
+        vkBindBufferMemory(device_, buf, mem, 0);
+
+        void* ptr;
+        vkMapMemory(device_, mem, 0, sz, 0, &ptr);
+        std::memcpy(ptr, data, (size_t)sz);
+        vkUnmapMemory(device_, mem);
+    };
+
+    const int SEG = 16;
+    const float pi = 3.14159265f;
+
+    // ── Move tool geometry (cone + cylinder along +Z) ──
+    {
+        std::vector<GizmoVertex> verts;
+        std::vector<uint32_t> idx;
+
+        float gLen = 0.6f;
+        float coneH = 0.15f;
+        float coneR = 0.06f;
+        float lineR = 0.012f;
+
+        // --- Cylinder (axis line) along +Z ---
+        // Bottom ring (z=0) with normals pointing outward
+        uint32_t botRing = (uint32_t)verts.size();
+        for (int i = 0; i < SEG; i++) {
+            float a = 2.0f * pi * i / SEG;
+            float ca = std::cos(a), sa = std::sin(a);
+            verts.push_back({{ca * lineR, sa * lineR, 0}, {ca, sa, 0}});
+        }
+        // Top ring (z=gLen) with normals pointing outward
+        uint32_t topRing = (uint32_t)verts.size();
+        for (int i = 0; i < SEG; i++) {
+            float a = 2.0f * pi * i / SEG;
+            float ca = std::cos(a), sa = std::sin(a);
+            verts.push_back({{ca * lineR, sa * lineR, gLen}, {ca, sa, 0}});
+        }
+        // Side quads -> 2 tris each
+        for (int i = 0; i < SEG; i++) {
+            int ni = (i + 1) % SEG;
+        idx.push_back(topRing + i);
+        idx.push_back(botRing + i);
+        idx.push_back(botRing + ni);
+        idx.push_back(topRing + i);
+        idx.push_back(botRing + ni);
+        idx.push_back(topRing + ni);
+    }
+
+    // --- Cone (arrowhead) along +Z ---
+    uint32_t coneBaseR = (uint32_t)verts.size();
+        for (int i = 0; i < SEG; i++) {
+            float a = 2.0f * pi * i / SEG;
+            float ca = std::cos(a), sa = std::sin(a);
+            verts.push_back({{ca * coneR, sa * coneR, gLen}, {0, 0, -1}});
+        }
+        uint32_t coneCenter = (uint32_t)verts.size();
+        verts.push_back({{0, 0, gLen}, {0, 0, -1}});
+        // Base tris
+        for (int i = 0; i < SEG; i++) {
+            int ni = (i + 1) % SEG;
+            idx.push_back(coneCenter);
+            idx.push_back(coneBaseR + ni);
+            idx.push_back(coneBaseR + i);
+        }
+
+        // Cone apex
+        uint32_t apex = (uint32_t)verts.size();
+        verts.push_back({{0, 0, gLen + coneH}, {0, 0, 1}});
+
+        // Cone side: for each segment, compute proper surface normal
+        float k = coneR / coneH;
+        float k2 = k * k;
+        for (int i = 0; i < SEG; i++) {
+            int ni = (i + 1) % SEG;
+            float a1 = 2.0f * pi * i / SEG;
+            float a2 = 2.0f * pi * ni / SEG;
+            float ca1 = std::cos(a1), sa1 = std::sin(a1);
+            float ca2 = std::cos(a2), sa2 = std::sin(a2);
+
+            // Face normal for triangle (apex, base_ni, base_i)
+            float nx1 = ca1, ny1 = sa1;
+            float nx2 = ca2, ny2 = sa2;
+
+            float v1x = ca2 * coneR;
+            float v1y = sa2 * coneR;
+            float v1z = gLen;
+            float v2x = ca1 * coneR;
+            float v2y = sa1 * coneR;
+            float v2z = gLen;
+
+            float e1x = v1x, e1y = v1y, e1z = v1z - (gLen + coneH);
+            float e2x = v2x, e2y = v2y, e2z = v2z - (gLen + coneH);
+
+            float fnx = e2y * e1z - e2z * e1y;
+            float fny = e2z * e1x - e2x * e1z;
+            float fnz = e2x * e1y - e2y * e1x;
+            float flen = std::sqrt(fnx*fnx + fny*fny + fnz*fnz);
+            if (flen > 1e-8f) { fnx /= flen; fny /= flen; fnz /= flen; }
+
+            verts.push_back({{v2x, v2y, v2z}, {fnx, fny, fnz}});
+            verts.push_back({{v1x, v1y, v1z}, {fnx, fny, fnz}});
+            verts.push_back({{0, 0, gLen + coneH}, {fnx, fny, fnz}});
+            uint32_t v2i = (uint32_t)verts.size() - 3;
+            uint32_t v1i = (uint32_t)verts.size() - 2;
+            uint32_t api = (uint32_t)verts.size() - 1;
+            idx.push_back(v2i);
+            idx.push_back(v1i);
+            idx.push_back(api);
+        }
+
+        createDevBuf(verts.size() * sizeof(GizmoVertex), verts.data(),
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     gizmoMove_.vertexBuf, gizmoMove_.vertexMem);
+        createDevBuf(idx.size() * sizeof(uint32_t), idx.data(),
+                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     gizmoMove_.indexBuf, gizmoMove_.indexMem);
+        gizmoMove_.indexCount = (uint32_t)idx.size();
+    }
+
+    // ── Rotate tool geometry (torus ring in XY plane) ──
+    {
+        std::vector<GizmoVertex> verts;
+        std::vector<uint32_t> idx;
+
+        float ringRad = 0.6f;
+        float ringThick = 0.015f;
+        int majSeg = 24, minSeg = 6;
+
+        for (int mi = 0; mi < majSeg; mi++) {
+            float u = 2.0f * pi * mi / majSeg;
+            float cu = std::cos(u), su = std::sin(u);
+            for (int ni = 0; ni < minSeg; ni++) {
+                float v = 2.0f * pi * ni / minSeg;
+                float cv = std::cos(v), sv = std::sin(v);
+                float px = (ringRad + ringThick * cv) * cu;
+                float py = (ringRad + ringThick * cv) * su;
+                float pz = ringThick * sv;
+                float nx = cv * cu;
+                float ny = cv * su;
+                float nz = sv;
+                verts.push_back({{px, py, pz}, {nx, ny, nz}});
+            }
+        }
+
+        for (int mi = 0; mi < majSeg; mi++) {
+            int nmi = (mi + 1) % majSeg;
+            for (int ni = 0; ni < minSeg; ni++) {
+                int nni = (ni + 1) % minSeg;
+                uint32_t i0 = mi * minSeg + ni;
+                uint32_t i1 = nmi * minSeg + ni;
+                uint32_t i2 = nmi * minSeg + nni;
+                uint32_t i3 = mi * minSeg + nni;
+                idx.push_back(i0); idx.push_back(i1); idx.push_back(i2);
+                idx.push_back(i0); idx.push_back(i2); idx.push_back(i3);
+            }
+        }
+
+        createDevBuf(verts.size() * sizeof(GizmoVertex), verts.data(),
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     gizmoRotate_.vertexBuf, gizmoRotate_.vertexMem);
+        createDevBuf(idx.size() * sizeof(uint32_t), idx.data(),
+                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     gizmoRotate_.indexBuf, gizmoRotate_.indexMem);
+        gizmoRotate_.indexCount = (uint32_t)idx.size();
+    }
+
+    // ── Scale tool geometry (cube + cylinder along +Z) ──
+    {
+        std::vector<GizmoVertex> verts;
+        std::vector<uint32_t> idx;
+
+        float gLen = 0.6f;
+        float cubeHe = 0.05f;
+        float lineR = 0.012f;
+
+        // --- Cylinder (axis line) same as move tool ---
+        uint32_t botRing = (uint32_t)verts.size();
+        for (int i = 0; i < SEG; i++) {
+            float a = 2.0f * pi * i / SEG;
+            float ca = std::cos(a), sa = std::sin(a);
+            verts.push_back({{ca * lineR, sa * lineR, 0}, {ca, sa, 0}});
+        }
+        uint32_t topRing = (uint32_t)verts.size();
+        for (int i = 0; i < SEG; i++) {
+            float a = 2.0f * pi * i / SEG;
+            float ca = std::cos(a), sa = std::sin(a);
+            verts.push_back({{ca * lineR, sa * lineR, gLen}, {ca, sa, 0}});
+        }
+        for (int i = 0; i < SEG; i++) {
+            int ni = (i + 1) % SEG;
+            idx.push_back(topRing + i);
+            idx.push_back(botRing + i);
+            idx.push_back(botRing + ni);
+            idx.push_back(topRing + i);
+            idx.push_back(botRing + ni);
+            idx.push_back(topRing + ni);
+        }
+
+        // --- Cube centered at z=gLen with half-extent=cubeHe ---
+        // 6 faces with 4 vertices each (flat shading, explicit per-face normals)
+        float h = cubeHe;
+        float cz = gLen;
+
+        // Each face: 4 vertices with same normal
+        struct Face { float verts[4][3]; float normal[3]; };
+        Face faces[6] = {
+            // +X
+            { {{h, -h, cz-h}, {h, h, cz-h}, {h, h, cz+h}, {h, -h, cz+h}}, {1,0,0} },
+            // -X
+            { {{-h, -h, cz+h}, {-h, h, cz+h}, {-h, h, cz-h}, {-h, -h, cz-h}}, {-1,0,0} },
+            // +Y
+            { {{-h, h, cz-h}, {h, h, cz-h}, {h, h, cz+h}, {-h, h, cz+h}}, {0,1,0} },
+            // -Y
+            { {{-h, -h, cz+h}, {h, -h, cz+h}, {h, -h, cz-h}, {-h, -h, cz-h}}, {0,-1,0} },
+            // +Z
+            { {{-h, -h, cz+h}, {h, -h, cz+h}, {h, h, cz+h}, {-h, h, cz+h}}, {0,0,1} },
+            // -Z
+            { {{-h, -h, cz-h}, {-h, h, cz-h}, {h, h, cz-h}, {h, -h, cz-h}}, {0,0,-1} },
+        };
+
+        for (auto& f : faces) {
+            uint32_t base = (uint32_t)verts.size();
+            for (int vi = 0; vi < 4; vi++)
+                verts.push_back({{f.verts[vi][0], f.verts[vi][1], f.verts[vi][2]},
+                                 {f.normal[0], f.normal[1], f.normal[2]}});
+            // Two tris per quad: 0-1-2, 0-2-3
+            idx.push_back(base); idx.push_back(base+1); idx.push_back(base+2);
+            idx.push_back(base); idx.push_back(base+2); idx.push_back(base+3);
+        }
+
+        createDevBuf(verts.size() * sizeof(GizmoVertex), verts.data(),
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     gizmoScale_.vertexBuf, gizmoScale_.vertexMem);
+        createDevBuf(idx.size() * sizeof(uint32_t), idx.data(),
+                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     gizmoScale_.indexBuf, gizmoScale_.indexMem);
+        gizmoScale_.indexCount = (uint32_t)idx.size();
+    }
+}
+
+void VulkanApp::destroyGizmoBuffers() {
+    auto destroy = [&](GizmoMesh& m) {
+        if (m.indexBuf) vkDestroyBuffer(device_, m.indexBuf, nullptr);
+        if (m.indexMem) vkFreeMemory(device_, m.indexMem, nullptr);
+        if (m.vertexBuf) vkDestroyBuffer(device_, m.vertexBuf, nullptr);
+        if (m.vertexMem) vkFreeMemory(device_, m.vertexMem, nullptr);
+        m = GizmoMesh{};
+    };
+    destroy(gizmoMove_);
+    destroy(gizmoRotate_);
+    destroy(gizmoScale_);
+}
+
+// ── gizmo pipeline ───────────────────────────────────────────────────────
+
+void VulkanApp::createGizmoPipeline() {
+    VkShaderModule vertMod = compileShader("shaders/gizmo.vert",
+                                           VK_SHADER_STAGE_VERTEX_BIT);
+    VkShaderModule fragMod = compileShader("shaders/gizmo.frag",
+                                           VK_SHADER_STAGE_FRAGMENT_BIT);
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertMod;
+    stages[0].pName  = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragMod;
+    stages[1].pName  = "main";
+
+    // Vertex input
+    VkVertexInputBindingDescription bindDesc{};
+    bindDesc.binding   = 0;
+    bindDesc.stride    = sizeof(GizmoVertex);
+    bindDesc.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attrDesc[2]{};
+    attrDesc[0].location = 0;
+    attrDesc[0].binding  = 0;
+    attrDesc[0].format   = VK_FORMAT_R32G32B32_SFLOAT;
+    attrDesc[0].offset   = offsetof(GizmoVertex, pos);
+    attrDesc[1].location = 1;
+    attrDesc[1].binding  = 0;
+    attrDesc[1].format   = VK_FORMAT_R32G32B32_SFLOAT;
+    attrDesc[1].offset   = offsetof(GizmoVertex, normal);
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount   = 1;
+    vi.pVertexBindingDescriptions      = &bindDesc;
+    vi.vertexAttributeDescriptionCount = 2;
+    vi.pVertexAttributeDescriptions    = attrDesc;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport viewport{};
+    viewport.x        = 0.0f;
+    viewport.y        = 0.0f;
+    viewport.width    = static_cast<float>(swapchainExtent_.width);
+    viewport.height   = static_cast<float>(swapchainExtent_.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{};
+    scissor.extent = swapchainExtent_;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.pViewports    = &viewport;
+    vp.scissorCount  = 1;
+    vp.pScissors     = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode    = VK_CULL_MODE_NONE;
+    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth   = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState cbAtt{};
+    cbAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments    = &cbAtt;
+
+    // Push constant range
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcRange.offset     = 0;
+    pcRange.size       = 80; // vec4 (16) + mat4 (64)
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount         = 1;
+    plci.pSetLayouts            = &descSetLayout_;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &pcRange;
+    VkResult res = vkCreatePipelineLayout(device_, &plci, nullptr, &gizmoPipelineLayout_);
+    if (res != VK_SUCCESS) throw std::runtime_error("Failed to create gizmo pipeline layout");
+
+    VkGraphicsPipelineCreateInfo gpci{};
+    gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpci.stageCount          = 2;
+    gpci.pStages             = stages;
+    gpci.pVertexInputState   = &vi;
+    gpci.pInputAssemblyState = &ia;
+    gpci.pViewportState      = &vp;
+    gpci.pRasterizationState = &rs;
+    gpci.pMultisampleState   = &ms;
+    gpci.pColorBlendState    = &cb;
+    gpci.layout              = gizmoPipelineLayout_;
+    gpci.renderPass          = renderPass_;
+
+    res = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpci, nullptr, &gizmoPipeline_);
+    if (res != VK_SUCCESS) throw std::runtime_error("Failed to create gizmo pipeline");
+
+    vkDestroyShaderModule(device_, fragMod, nullptr);
+    vkDestroyShaderModule(device_, vertMod, nullptr);
+}
+
+// ── Draw gizmo meshes ────────────────────────────────────────────────────
+
+void VulkanApp::drawGizmo(VkCommandBuffer cmd, VkBuffer vtxBuf, VkBuffer idxBuf,
+                          uint32_t idxCount, const std::array<float, 3>& center,
+                          ToolType tool) {
+    if (tool != ToolType::Move && tool != ToolType::Rotate && tool != ToolType::Scale)
+        return;
+
+    float axisColors[3][3] = {
+        {1, 0.2f, 0.2f},  // X: red
+        {0.2f, 1, 0.2f},  // Y: green
+        {0.2f, 0.2f, 1},  // Z: blue
+    };
+
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vtxBuf, &offset);
+    vkCmdBindIndexBuffer(cmd, idxBuf, 0, VK_INDEX_TYPE_UINT32);
+
+    for (int axis = 0; axis < 3; axis++) {
+        // Build model matrix: translate(center) * rotate_to_axis
+        // Geometry is along +Z, rotate to align with X, Y, or Z
+        float rot[16];
+        std::memset(rot, 0, sizeof(rot));
+        rot[12] = rot[13] = rot[14] = 0; rot[15] = 1;
+
+        if (axis == 0) {
+            // X axis: rotate +Z to +X  (rotateY(-90°))
+            rot[0] = 0;  rot[1] = 0;  rot[2] = -1;
+            rot[4] = 0;  rot[5] = 1;  rot[6] = 0;
+            rot[8] = 1;  rot[9] = 0;  rot[10]= 0;
+        } else if (axis == 1) {
+            // Y axis: rotate +Z to +Y  (rotateX(-90°))
+            rot[0] = 1;  rot[1] = 0;  rot[2] = 0;
+            rot[4] = 0;  rot[5] = 0;  rot[6] = -1;
+            rot[8] = 0;  rot[9] = 1;  rot[10]= 0;
+        } else {
+            // Z axis: identity
+            rot[0] = 1; rot[1] = 0; rot[2] = 0;
+            rot[4] = 0; rot[5] = 1; rot[6] = 0;
+            rot[8] = 0; rot[9] = 0; rot[10]= 1;
+        }
+
+        // Apply translation
+        float model[16];
+        std::memcpy(model, rot, sizeof(rot));
+        model[12] = center[0];
+        model[13] = center[1];
+        model[14] = center[2];
+
+        // Push constants: vec4 color + mat4 model
+        struct PushConst {
+            float color[4];
+            float model[16];
+        };
+        PushConst pc;
+        pc.color[0] = axisColors[axis][0];
+        pc.color[1] = axisColors[axis][1];
+        pc.color[2] = axisColors[axis][2];
+        pc.color[3] = 1.0f;
+        std::memcpy(pc.model, model, sizeof(model));
+
+        vkCmdPushConstants(cmd, gizmoPipelineLayout_,
+                           VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(PushConst), &pc);
+        vkCmdDrawIndexed(cmd, idxCount, 1, 0, 0, 0);
+    }
+}
+
 // ── framebuffers ─────────────────────────────────────────────────────────
 
 void VulkanApp::createFramebuffers() {
@@ -953,6 +1425,29 @@ void VulkanApp::recordCommandBuffer(Frame& frame, uint32_t imageIndex) {
                             pipelineLayout_, 0, 1, &descSet_, 0, nullptr);
     vkCmdDraw(frame.cmdBuffer, 3, 1, 0, 0);
 
+    // ── Draw mesh gizmos ──
+    {
+        std::array<float, 3> center = {0.0f, 0.0f, 0.0f};
+        if (selectedIndex_ >= 0 && selectedIndex_ < (int)placedObjects_.size()) {
+            auto& obj = placedObjects_[selectedIndex_];
+            center = {obj.px, obj.py, obj.pz};
+        }
+        vkCmdBindPipeline(frame.cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, gizmoPipeline_);
+        vkCmdBindDescriptorSets(frame.cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                gizmoPipelineLayout_, 0, 1, &descSet_, 0, nullptr);
+
+        if (activeTool_ == ToolType::Move) {
+            drawGizmo(frame.cmdBuffer, gizmoMove_.vertexBuf, gizmoMove_.indexBuf,
+                      gizmoMove_.indexCount, center, ToolType::Move);
+        } else if (activeTool_ == ToolType::Rotate) {
+            drawGizmo(frame.cmdBuffer, gizmoRotate_.vertexBuf, gizmoRotate_.indexBuf,
+                      gizmoRotate_.indexCount, center, ToolType::Rotate);
+        } else if (activeTool_ == ToolType::Scale) {
+            drawGizmo(frame.cmdBuffer, gizmoScale_.vertexBuf, gizmoScale_.indexBuf,
+                      gizmoScale_.indexCount, center, ToolType::Scale);
+        }
+    }
+
     vkCmdNextSubpass(frame.cmdBuffer, VK_SUBPASS_CONTENTS_INLINE);
 
     renderImgui();
@@ -1095,10 +1590,49 @@ void VulkanApp::updateUniforms() {
         ubo.hiddenFlags[i] = word;
     }
 
+    // ── View-projection matrix for mesh gizmo rendering ──
+    float rox = cx + camTarget_[0];
+    float roy = cy + camTarget_[1];
+    float roz = cz + camTarget_[2];
+
+    // View matrix (column-major, right-handed, camera looks along -Z)
+    float view[16] = {
+        rux,    upx,   -fdx,   0,
+        ruy,    upy,   -fdy,   0,
+        ruz,    upz,   -fdz,   0,
+        -(rux*rox + ruy*roy + ruz*roz),
+        -(upx*rox + upy*roy + upz*roz),
+         fdx*rox + fdy*roy + fdz*roz,
+        1
+    };
+
+    // Projection matrix (Vulkan: Y-down, depth [0,1])
+    // fov=1.0 in shader means tan(verticalHalfFov) = 1
+    float a     = float(width_) / float(height_);
+    float near_ = 0.1f;
+    float far_  = 50.0f;
+    float ffn   = far_ - near_;
+    float proj[16] = {
+        1.0f/a,  0,  0,                  0,
+        0,      -1,  0,                  0,
+        0,       0, -far_/ffn,          -1,
+        0,       0, -near_*far_/ffn,     0
+    };
+
+    // Multiply: viewProj = proj * view (column-major)
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            ubo.viewProj[c*4 + r] =
+                proj[0*4+r]*view[c*4+0] + proj[1*4+r]*view[c*4+1] +
+                proj[2*4+r]*view[c*4+2] + proj[3*4+r]*view[c*4+3];
+        }
+    }
+
     void* data;
     vkMapMemory(device_, uboMem_, 0, sizeof(UBO), 0, &data);
     std::memcpy(data, &ubo, sizeof(UBO));
     vkUnmapMemory(device_, uboMem_);
+
 }
 
 // ── CPU SDF helpers ──────────────────────────────────────────────────────
@@ -1255,6 +1789,8 @@ void VulkanApp::placeObject() {
     obj.type = addAsVoid_ ? 1.0f : 0.0f;
     obj.primType = static_cast<float>(pt);
     obj.hidden = 0.0f;
+    obj.rx = obj.ry = obj.rz = 0.0f;
+    obj.sx = obj.sy = obj.sz = 1.0f;
 
     switch (pt) {
         case PrimType::Box:
@@ -1953,6 +2489,9 @@ void VulkanApp::cleanup() {
     vkFreeMemory(device_, uboMem_, nullptr);
     vkDestroyDescriptorPool(device_, descPool_, nullptr);
     vkDestroyDescriptorSetLayout(device_, descSetLayout_, nullptr);
+    destroyGizmoBuffers();
+    vkDestroyPipeline(device_, gizmoPipeline_, nullptr);
+    vkDestroyPipelineLayout(device_, gizmoPipelineLayout_, nullptr);
     vkDestroyPipeline(device_, pipeline_, nullptr);
     vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
     vkDestroyRenderPass(device_, renderPass_, nullptr);

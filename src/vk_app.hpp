@@ -39,7 +39,12 @@ struct PlacedObject {
     float param1;     // shape-specific param (box-half-extent, sphere-r, donut-R, cyl-h, pyr-h)
     float param2;     // shape-specific param (box-half-extent-z, donut-r, cyl-r, pyr-r)
     float px, py, pz, hidden; // position + hidden flag
+    float rx, ry, rz;         // rotation (Euler angles in radians)
+    float _rotPad;            // padding to match GLSL vec4 alignment
+    float sx, sy, sz;         // scale factors
+    float _sclPad;            // padding to match GLSL vec4 alignment
 };
+static_assert(sizeof(PlacedObject) == 64, "PlacedObject must be 64 bytes");
 
 static constexpr int MAX_OBJECTS = 256;
 
@@ -87,12 +92,22 @@ private:
     ToolType ghostTool_ = ToolType::Select;
     bool ghostVoid_ = false;
 
-    // Selection & gizmo move
+    // Selection & gizmo
     int  gizmoAxis_ = 0;  // 0=none, 1=X, 2=Y, 3=Z
     bool isDragging_ = false;
     int  dragStartSX_ = 0, dragStartSY_ = 0;
+
+    // Drag start state for position
     float dragObjX_ = 0, dragObjY_ = 0, dragObjZ_ = 0;
-    std::vector<float> dragOrigX_, dragOrigY_, dragOrigZ_; // per-object start positions (multi)
+    std::vector<float> dragOrigX_, dragOrigY_, dragOrigZ_;
+
+    // Drag start state for rotation
+    float dragObjRx_ = 0, dragObjRy_ = 0, dragObjRz_ = 0;
+    std::vector<float> dragOrigRx_, dragOrigRy_, dragOrigRz_;
+
+    // Drag start state for scale
+    float dragObjSx_ = 0, dragObjSy_ = 0, dragObjSz_ = 0;
+    std::vector<float> dragOrigSx_, dragOrigSy_, dragOrigSz_;
 
     // Vulkan core
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -114,6 +129,22 @@ private:
     VkRenderPass imguiRenderPass_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+
+    // Gizmo mesh pipeline
+    VkPipelineLayout gizmoPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline gizmoPipeline_ = VK_NULL_HANDLE;
+
+    // Gizmo vertex/index buffers
+    struct GizmoMesh {
+        VkBuffer vertexBuf = VK_NULL_HANDLE;
+        VkDeviceMemory vertexMem = VK_NULL_HANDLE;
+        VkBuffer indexBuf = VK_NULL_HANDLE;
+        VkDeviceMemory indexMem = VK_NULL_HANDLE;
+        uint32_t indexCount = 0;
+    };
+    GizmoMesh gizmoMove_;
+    GizmoMesh gizmoRotate_;
+    GizmoMesh gizmoScale_;
 
     // Descriptors
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
@@ -165,17 +196,28 @@ private:
         alignas(16) std::array<float, 4> camUp;       // camera up direction
         alignas(16) std::array<uint32_t, 8> hiddenFlags; // bitset for 256 objects
 
-        // Multi-selection highlight
-        int32_t selectedCount;
-        float _padMsel[3];
-        alignas(16) std::array<float, 4> selPos[32];
-        alignas(16) std::array<float, 4> selInfo[32];
-    };
+    // Multi-selection highlight
+    int32_t selectedCount;
+    float _padMsel[3];
+    alignas(16) std::array<float, 4> selPos[32];
+    alignas(16) std::array<float, 4> selInfo[32];
+
+    // Projection * view matrix for mesh gizmo rendering
+    alignas(16) std::array<float, 16> viewProj;
+};
 
     // Init helpers
     void initWindow();
     void initVulkan();
     void cleanup();
+
+    // Gizmo mesh helpers
+    void createGizmoPipeline();
+    void createGizmoBuffers();
+    void destroyGizmoBuffers();
+    void drawGizmo(VkCommandBuffer cmd, VkBuffer vtxBuf, VkBuffer idxBuf,
+                   uint32_t idxCount, const std::array<float, 3>& center,
+                   ToolType tool);
 
     void createInstance();
     void setupDebug();
