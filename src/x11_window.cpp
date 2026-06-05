@@ -74,6 +74,8 @@ void X11Window::pollEvents() {
         case ButtonPress:
             if (ev.xbutton.button == Button1) {
                 mouse_.leftDown = true;
+            } else if (ev.xbutton.button == Button2) {
+                mouse_.middleDown = true;
             } else if (ev.xbutton.button == Button4) {
                 mouse_.scroll += 1;
             } else if (ev.xbutton.button == Button5) {
@@ -83,6 +85,8 @@ void X11Window::pollEvents() {
         case ButtonRelease:
             if (ev.xbutton.button == Button1) {
                 mouse_.leftDown = false;
+            } else if (ev.xbutton.button == Button2) {
+                mouse_.middleDown = false;
             }
             break;
         case MotionNotify:

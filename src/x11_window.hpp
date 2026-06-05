@@ -20,6 +20,7 @@ struct MouseState {
     int  x = 0, y = 0;
     int  dx = 0, dy = 0;
     bool leftDown = false;
+    bool middleDown = false;
     int  scroll = 0;
 };
 

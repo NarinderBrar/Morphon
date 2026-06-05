@@ -2124,6 +2124,30 @@ void VulkanApp::handleInput() {
         camPhi_   += md.dy * 0.005f;
         camPhi_ = std::max(-1.5f, std::min(1.5f, camPhi_));
     }
+
+    // Pan camera with MMB
+    bool mmbDown = md.middleDown;
+#ifdef _WIN32
+    mmbDown = mmbDown || (GetAsyncKeyState(VK_MBUTTON) & 0x8000);
+#endif
+    if (!isPlace && mmbDown && !isDragging_ && !marqueeActive_) {
+        float cx = camDist_ * std::cos(camPhi_) * std::sin(camTheta_);
+        float cy = camDist_ * std::sin(camPhi_);
+        float cz = camDist_ * std::cos(camPhi_) * std::cos(camTheta_);
+        float flen = std::sqrt(cx*cx + cy*cy + cz*cz);
+        float fdx = -cx / flen, fdy = -cy / flen, fdz = -cz / flen;
+        float rux = -fdz, ruy = 0.0f, ruz = fdx;
+        float rlen = std::sqrt(rux*rux + ruy*ruy + ruz*ruz);
+        rux /= rlen; ruy /= rlen; ruz /= rlen;
+        float upx = ruy * fdz - ruz * fdy;
+        float upy = ruz * fdx - rux * fdz;
+        float upz = rux * fdy - ruy * fdx;
+        float panScale = camDist_ * 0.003f;
+        camTarget_[0] -= (rux * md.dx - upx * md.dy) * panScale;
+        camTarget_[1] -= (ruy * md.dx - upy * md.dy) * panScale;
+        camTarget_[2] -= (ruz * md.dx - upz * md.dy) * panScale;
+    }
+
     camDist_ *= (1.0f + md.scroll * 0.05f);
     camDist_ = std::max(1.0f, std::min(50.0f, camDist_));
 

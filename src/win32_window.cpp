@@ -133,6 +133,16 @@ LRESULT CALLBACK Win32Window::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             ReleaseCapture();
             win->mouse_.leftDown = false;
             return 0;
+        case WM_MBUTTONDOWN:
+            SetCapture(hwnd);
+            win->mouse_.middleDown = true;
+            win->mouse_.x = static_cast<int>(LOWORD(lParam));
+            win->mouse_.y = static_cast<int>(HIWORD(lParam));
+            return 0;
+        case WM_MBUTTONUP:
+            ReleaseCapture();
+            win->mouse_.middleDown = false;
+            return 0;
         case WM_MOUSEMOVE:
             {
                 int x = static_cast<int>(LOWORD(lParam));
