@@ -1472,7 +1472,7 @@ static PrimType toolToPrimType(ToolType t) {
 static float shapeHalfHeight(const PlacedObject& obj) {
     int pt = static_cast<int>(obj.primType);
     switch (pt) {
-        case 0: return obj.param1;
+        case 0: return obj._rotPad;
         case 1: return obj.param1;
         case 2: return obj.param2;
         case 3: return obj.param1;
@@ -1488,6 +1488,7 @@ static const char* toolName(ToolType t) {
         case ToolType::Move:     return "Move";
         case ToolType::Rotate:   return "Rotate";
         case ToolType::Scale:    return "Scale";
+        case ToolType::Edit:     return "Edit";
         case ToolType::Box:      return "Box";
         case ToolType::Sphere:   return "Sphere";
         case ToolType::Donut:    return "Donut";
@@ -1543,7 +1544,7 @@ void VulkanApp::updateUniforms() {
         PrimType pt = ::toolToPrimType(activeTool_);
         tmp.primType = static_cast<float>(pt);
         switch (pt) {
-            case PrimType::Box:      tmp.param1 = 0.5f; tmp.param2 = 0.5f; break;
+            case PrimType::Box:      tmp.param1 = 0.5f; tmp.param2 = 0.5f; tmp._rotPad = 0.5f; break;
             case PrimType::Sphere:   tmp.param1 = 0.5f; tmp.param2 = 0.0f; break;
             case PrimType::Donut:    tmp.param1 = 0.6f; tmp.param2 = 0.25f; break;
             case PrimType::Cylinder: tmp.param1 = 0.5f; tmp.param2 = 0.35f; break;
@@ -1551,7 +1552,7 @@ void VulkanApp::updateUniforms() {
         }
         float lift = ::shapeHalfHeight(tmp);
         ubo.ghostPos = {ghostPosX_, ghostPosY_ + lift, ghostPosZ_, 1.0f};
-        ubo.ghostPrimInfo = {tmp.primType, tmp.param1, tmp.param2, 0.0f};
+        ubo.ghostPrimInfo = {tmp.primType, tmp.param1, tmp.param2, tmp._rotPad};
     } else {
         ubo.ghostPos = {0, 0, 0, 0};
         ubo.ghostPrimInfo = {0, 0, 0, 0};
@@ -1560,21 +1561,25 @@ void VulkanApp::updateUniforms() {
     if (selectedIndex_ >= 0 && selectedIndex_ < (int)placedObjects_.size()) {
         auto& s = placedObjects_[selectedIndex_];
         ubo.selectedPos = {s.px, s.py, s.pz, 1.0f};
-        ubo.selectedPrimInfo = {s.primType, s.param1, s.param2,
-                                (activeTool_ == ToolType::Move) ? 1.0f : 0.0f};
+        ubo.selectedPrimInfo = {s.primType, s.param1, s.param2, s._rotPad};
+        // Suppress bbox wireframe in Edit tool — face highlight overlay replaces it.
+        if (activeTool_ == ToolType::Edit)
+            ubo.selectedPos[3] = 0.0f;
     } else {
         ubo.selectedPos = {0,0,0,0};
         ubo.selectedPrimInfo = {0,0,0,0};
     }
 
-    // Multi-selection highlight data
+    // Multi-selection highlight data (suppressed in Edit tool)
     int mselCount = 0;
-    for (int idx : selectedIndices_) {
-        if (idx >= 0 && idx < (int)placedObjects_.size() && mselCount < 32) {
-            auto& obj = placedObjects_[idx];
-            ubo.selPos[mselCount] = {obj.px, obj.py, obj.pz, 1.0f};
-            ubo.selInfo[mselCount] = {obj.primType, obj.param1, obj.param2, 0.0f};
-            mselCount++;
+    if (activeTool_ != ToolType::Edit) {
+        for (int idx : selectedIndices_) {
+            if (idx >= 0 && idx < (int)placedObjects_.size() && mselCount < 32) {
+                auto& obj = placedObjects_[idx];
+                ubo.selPos[mselCount] = {obj.px, obj.py, obj.pz, 1.0f};
+                ubo.selInfo[mselCount] = {obj.primType, obj.param1, obj.param2, obj._rotPad};
+                mselCount++;
+            }
         }
     }
     ubo.selectedCount = mselCount;
@@ -1688,7 +1693,7 @@ static float cpuSDF(const std::array<float, 3>& p, const PlacedObject& obj) {
 
     switch (primType) {
         case 0: // Box
-            return cpuSdBox(p, {p1, p1, p1});
+            return cpuSdBox(p, {p1, obj._rotPad, p2});
         case 1: // Sphere
             return cpuSdSphere(p, p1);
         case 2: // Donut (torus)
@@ -1794,7 +1799,7 @@ void VulkanApp::placeObject() {
 
     switch (pt) {
         case PrimType::Box:
-            obj.param1 = 0.5f; obj.param2 = 0.5f;
+            obj.param1 = 0.5f; obj.param2 = 0.5f; obj._rotPad = 0.5f;
             break;
         case PrimType::Sphere:
             obj.param1 = 0.5f; obj.param2 = 0.0f;
@@ -2020,6 +2025,86 @@ void VulkanApp::doGizmoDrag(int sx, int sy) {
     updateObjectBuffer();
 }
 
+void VulkanApp::doFaceDrag(int sx, int sy) {
+    if (selectedIndex_ < 0 || faceDragAxis_ == 0) return;
+    if (selectedIndex_ >= (int)placedObjects_.size()) return;
+    auto& obj = placedObjects_[selectedIndex_];
+    if (static_cast<int>(obj.primType) != 0) return;
+
+    float aspect = float(width_) / float(height_);
+    float fov = 1.0f;
+
+    // Camera basis
+    float cx = camDist_ * std::cos(camPhi_) * std::sin(camTheta_);
+    float cy = camDist_ * std::sin(camPhi_);
+    float cz = camDist_ * std::cos(camPhi_) * std::cos(camTheta_);
+    float rox = cx + camTarget_[0], roy = cy + camTarget_[1], roz = cz + camTarget_[2];
+    float fdx = camTarget_[0] - rox, fdy = camTarget_[1] - roy, fdz = camTarget_[2] - roz;
+    float flen = std::sqrt(fdx*fdx + fdy*fdy + fdz*fdz);
+    fdx /= flen; fdy /= flen; fdz /= flen;
+    float rux = fdy * 0.0f - fdz * 1.0f;
+    float ruy = fdz * 0.0f - fdx * 0.0f;
+    float ruz = fdx * 1.0f - fdy * 0.0f;
+    float rlen = std::sqrt(rux*rux + ruy*ruy + ruz*ruz);
+    if (rlen > 1e-8f) { rux /= rlen; ruy /= rlen; ruz /= rlen; }
+    float upx = ruy * fdz - ruz * fdy;
+    float upy = ruz * fdx - rux * fdz;
+    float upz = rux * fdy - ruy * fdx;
+
+    // Ray direction for current mouse
+    float ndcX = (2.0f * sx / float(width_) - 1.0f) * aspect;
+    float ndcY = -(2.0f * sy / float(height_) - 1.0f);
+    float rdx = fdx + rux * ndcX * fov + upx * ndcY * fov;
+    float rdy = fdy + ruy * ndcX * fov + upy * ndcY * fov;
+    float rdz = fdz + ruz * ndcX * fov + upz * ndcY * fov;
+    float rdlen = std::sqrt(rdx*rdx + rdy*rdy + rdz*rdz);
+    rdx /= rdlen; rdy /= rdlen; rdz /= rdlen;
+
+    // Plane through object center, perpendicular to camera view
+    float planeDist = (obj.px - rox)*fdx + (obj.py - roy)*fdy + (obj.pz - roz)*fdz;
+    float t = planeDist / (rdx*fdx + rdy*fdy + rdz*fdz);
+    float ix = rox + rdx*t, iy = roy + rdy*t, iz = roz + rdz*t;
+
+    // Ray direction for drag start
+    float ndcSX = (2.0f * faceDragStartX_ / float(width_) - 1.0f) * aspect;
+    float ndcSY = -(2.0f * faceDragStartY_ / float(height_) - 1.0f);
+    float srdx = fdx + rux * ndcSX * fov + upx * ndcSY * fov;
+    float srdy = fdy + ruy * ndcSX * fov + upy * ndcSY * fov;
+    float srdz = fdz + ruz * ndcSX * fov + upz * ndcSY * fov;
+    float srdlen = std::sqrt(srdx*srdx + srdy*srdy + srdz*srdz);
+    srdx /= srdlen; srdy /= srdlen; srdz /= srdlen;
+    float st = planeDist / (srdx*fdx + srdy*fdy + srdz*fdz);
+    float six = rox + srdx*st, siy = roy + srdy*st, siz = roz + srdz*st;
+
+    // Face normal direction in world space
+    float nx = 0, ny = 0, nz = 0;
+    if (faceDragAxis_ == 1) { nx = faceDragSign_; }
+    else if (faceDragAxis_ == 2) { ny = faceDragSign_; }
+    else if (faceDragAxis_ == 3) { nz = faceDragSign_; }
+
+    // Delta along face normal
+    float delta = (ix - six)*nx + (iy - siy)*ny + (iz - siz)*nz;
+
+    // Move only the dragged face by shifting both half-extent and center.
+    // Changing only the half-extent scales the box (both faces move).
+    // Shifting the center by delta/2 keeps the opposite face in place.
+    float halfDelta = delta * 0.5f;
+    float newHalf = std::max(0.05f, faceDragOrigSx_ + halfDelta);
+
+    if (faceDragAxis_ == 1) {
+        obj.param1 = newHalf;
+        obj.px = faceDragOrigSy_ + halfDelta * faceDragSign_;
+    } else if (faceDragAxis_ == 2) {
+        obj._rotPad = newHalf;
+        obj.py = faceDragOrigSy_ + halfDelta * faceDragSign_;
+    } else {
+        obj.param2 = newHalf;
+        obj.pz = faceDragOrigSy_ + halfDelta * faceDragSign_;
+    }
+
+    updateObjectBuffer();
+}
+
 // ── Boolean operations ────────────────────────────────────────────────────
 
 void VulkanApp::executeBooleanOp() {
@@ -2098,6 +2183,45 @@ void VulkanApp::handleInput() {
                 startGizmoDrag(m.x, m.y);
             }
         }
+        if (activeTool_ == ToolType::Edit && selectedIndex_ >= 0) {
+            auto& obj = placedObjects_[selectedIndex_];
+            if (static_cast<int>(obj.primType) == 0) {
+                float hx, hy, hz;
+                if (cpuRayMarch(m.x, m.y, hx, hy, hz)) {
+                    // Transform hit point to object local space (accounting for scale)
+                    std::array<float, 3> lp = {
+                        (hx - obj.px) / obj.sx,
+                        (hy - obj.py) / obj.sy,
+                        (hz - obj.pz) / obj.sz
+                    };
+                    float d = cpuSdBox(lp, {obj.param1, obj._rotPad, obj.param2});
+                    if (d < 0.05f) {
+                        // Which face was hit? The one closest to the surface.
+                        float dX = std::abs(std::abs(lp[0]) - obj.param1);
+                        float dY = std::abs(std::abs(lp[1]) - obj._rotPad);
+                        float dZ = std::abs(std::abs(lp[2]) - obj.param2);
+
+                        int axis = 1; float sign = 1;
+                        if (dX <= dY && dX <= dZ) { axis = 1; sign = lp[0] > 0 ? 1.0f : -1.0f; }
+                        else if (dY <= dX && dY <= dZ) { axis = 2; sign = lp[1] > 0 ? 1.0f : -1.0f; }
+                        else { axis = 3; sign = lp[2] > 0 ? 1.0f : -1.0f; }
+
+                        // Get original extent for the face axis
+                        float he = (axis == 1) ? obj.param1 :
+                                   (axis == 2) ? obj._rotPad : obj.param2;
+                        float origPos = (axis == 1) ? obj.px :
+                                        (axis == 2) ? obj.py : obj.pz;
+                        faceDragOrigSx_ = he; // original half-extent
+                        faceDragOrigSy_ = origPos; // original position along axis
+                        faceDragAxis_ = axis;
+                        faceDragSign_ = sign;
+                        faceDragStartX_ = m.x;
+                        faceDragStartY_ = m.y;
+                        isDragging_ = true;
+                    }
+                }
+            }
+        }
         if (activeTool_ == ToolType::Marquee) {
             marqueeActive_ = true;
             marqueeStartX_ = m.x;
@@ -2113,9 +2237,12 @@ void VulkanApp::handleInput() {
         marqueeEndY_ = m.y;
     }
 
-    // ── Active gizmo drag ────────────────────────────────────
+    // ── Active gizmo/face drag ──────────────────────────────
     if (isDragging_ && m.leftDown) {
-        doGizmoDrag(m.x, m.y);
+        if (faceDragAxis_ != 0)
+            doFaceDrag(m.x, m.y);
+        else
+            doGizmoDrag(m.x, m.y);
     }
 
     // Orbit camera (only when NOT placing, dragging, or marquee)
@@ -2165,6 +2292,8 @@ void VulkanApp::handleInput() {
         selectedIndices_.clear();
         isDragging_ = false;
         gizmoAxis_ = 0;
+        faceDragAxis_ = 0;
+        faceDragSign_ = 0;
         marqueeActive_ = false;
         activeTool_ = ToolType::Select;
     }
@@ -2193,6 +2322,8 @@ void VulkanApp::handleInput() {
         if (isDragging_) {
             isDragging_ = false;
             gizmoAxis_ = 0;
+            faceDragAxis_ = 0;
+            faceDragSign_ = 0;
         } else if (marqueeActive_) {
             // Finalize marquee selection
             marqueeActive_ = false;
@@ -2344,6 +2475,7 @@ void VulkanApp::renderImgui() {
         toolItem(ToolType::Move,     "Move");
         toolItem(ToolType::Rotate,   "Rotate");
         toolItem(ToolType::Scale,    "Scale");
+        toolItem(ToolType::Edit,     "Edit");
 
         ImGui::Separator();
 
@@ -2447,6 +2579,56 @@ void VulkanApp::renderImgui() {
             ImGui::EndTabItem();
         }
 
+        // ── Properties Tab ───────────────────────────────────
+        if (ImGui::BeginTabItem("Properties")) {
+            if (selectedIndex_ >= 0 && selectedIndex_ < (int)placedObjects_.size()) {
+                auto& obj = placedObjects_[selectedIndex_];
+                int pi = static_cast<int>(obj.primType);
+                const char* pn = (pi >= 0 && pi < 5) ? primNames[pi] : "?";
+
+                ImGui::Text("Object [%d]: %s", selectedIndex_, pn);
+                ImGui::Separator();
+
+                bool changed = false;
+
+                changed |= ImGui::DragFloat3("Position", &obj.px, 0.05f);
+                changed |= ImGui::DragFloat3("Rotation", &obj.rx, 0.05f);
+                changed |= ImGui::DragFloat3("Scale", &obj.sx, 0.05f);
+
+                ImGui::Separator();
+
+                switch (static_cast<PrimType>(pi)) {
+                    case PrimType::Box:
+                        changed |= ImGui::DragFloat("Size X", &obj.param1, 0.05f, 0.01f, 5.0f);
+                        changed |= ImGui::DragFloat("Size Y", &obj._rotPad, 0.05f, 0.01f, 5.0f);
+                        changed |= ImGui::DragFloat("Size Z", &obj.param2, 0.05f, 0.01f, 5.0f);
+                        break;
+                    case PrimType::Sphere:
+                        changed |= ImGui::DragFloat("Radius", &obj.param1, 0.05f, 0.01f, 5.0f);
+                        break;
+                    case PrimType::Donut:
+                        changed |= ImGui::DragFloat("Major Radius", &obj.param1, 0.05f, 0.01f, 5.0f);
+                        changed |= ImGui::DragFloat("Minor Radius", &obj.param2, 0.05f, 0.01f, 5.0f);
+                        break;
+                    case PrimType::Cylinder:
+                        changed |= ImGui::DragFloat("Height", &obj.param1, 0.05f, 0.01f, 5.0f);
+                        changed |= ImGui::DragFloat("Radius", &obj.param2, 0.05f, 0.01f, 5.0f);
+                        break;
+                    case PrimType::Pyramid:
+                        changed |= ImGui::DragFloat("Height", &obj.param1, 0.05f, 0.01f, 5.0f);
+                        changed |= ImGui::DragFloat("Radius", &obj.param2, 0.05f, 0.01f, 5.0f);
+                        break;
+                }
+
+                if (changed)
+                    updateObjectBuffer();
+            } else {
+                ImGui::TextDisabled("No object selected");
+                ImGui::Text("Select an object to edit its properties.");
+            }
+            ImGui::EndTabItem();
+        }
+
         // ── Debug Tab ─────────────────────────────────────────
         if (ImGui::BeginTabItem("Debug")) {
             ImGui::Text("Merge Threshold");
@@ -2474,6 +2656,104 @@ void VulkanApp::renderImgui() {
                           IM_COL32(255, 255, 255, 40));
         dl->AddRect(ImVec2((float)x1, (float)y1), ImVec2((float)x2, (float)y2),
                     IM_COL32(255, 255, 255, 200), 0.0f, 0, 2.0f);
+    }
+
+    // ── Face edit highlight overlay ─────────────────────────────────────
+    if (faceDragAxis_ != 0 && selectedIndex_ >= 0 && selectedIndex_ < (int)placedObjects_.size()) {
+        auto& obj = placedObjects_[selectedIndex_];
+        if (static_cast<int>(obj.primType) == 0) {
+            // Camera basis (same as updateUniforms)
+            float cx = camDist_ * std::cos(camPhi_) * std::sin(camTheta_);
+            float cy = camDist_ * std::sin(camPhi_);
+            float cz = camDist_ * std::cos(camPhi_) * std::cos(camTheta_);
+            float rox = cx + camTarget_[0], roy = cy + camTarget_[1], roz = cz + camTarget_[2];
+            float fdx = camTarget_[0] - rox, fdy = camTarget_[1] - roy, fdz = camTarget_[2] - roz;
+            float flen = std::sqrt(fdx*fdx + fdy*fdy + fdz*fdz);
+            fdx /= flen; fdy /= flen; fdz /= flen;
+            float rux = -fdz, ruy = 0.0f, ruz = fdx;
+            float rlen = std::sqrt(rux*rux + ruy*ruy + ruz*ruz);
+            if (rlen > 1e-8f) { rux /= rlen; ruy /= rlen; ruz /= rlen; }
+            float upx = ruy*fdz - ruz*fdy;
+            float upy = ruz*fdx - rux*fdz;
+            float upz = rux*fdy - ruy*fdx;
+
+            // View matrix (column-major)
+            float view[16] = {
+                rux, upx, -fdx, 0,
+                ruy, upy, -fdy, 0,
+                ruz, upz, -fdz, 0,
+                -(rux*rox + ruy*roy + ruz*roz),
+                -(upx*rox + upy*roy + upz*roz),
+                 fdx*rox + fdy*roy + fdz*roz,
+                1
+            };
+
+            float aspect = float(width_) / float(height_);
+            float near_ = 0.1f, far_ = 50.0f;
+            float ffn = far_ - near_;
+            float proj[16] = {
+                1.0f/aspect, 0, 0, 0,
+                0, -1, 0, 0,
+                0, 0, -far_/ffn, -1,
+                0, 0, -near_*far_/ffn, 0
+            };
+
+            float vp[16];
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                    vp[c*4 + r] = proj[0*4+r]*view[c*4+0] + proj[1*4+r]*view[c*4+1] +
+                                  proj[2*4+r]*view[c*4+2] + proj[3*4+r]*view[c*4+3];
+
+            auto project = [&](float px, float py, float pz) -> ImVec2 {
+                float x = vp[0]*px + vp[4]*py + vp[8]*pz + vp[12];
+                float y = vp[1]*px + vp[5]*py + vp[9]*pz + vp[13];
+                float w = vp[3]*px + vp[7]*py + vp[11]*pz + vp[15];
+                if (w < 1e-8f) return ImVec2(-1e5f, -1e5f);
+                float ndx = x / w, ndy = y / w;
+                return ImVec2((ndx * 0.5f + 0.5f) * width_,
+                             (1.0f - ndy * 0.5f - 0.5f) * height_);
+            };
+
+            float hx = obj.param1 * obj.sx, hy = obj._rotPad * obj.sy, hz = obj.param2 * obj.sz;
+            float px = obj.px, py = obj.py, pz = obj.pz;
+
+            ImVec2 corners[4];
+            if (faceDragAxis_ == 1) {
+                float fx = px + faceDragSign_ * hx;
+                corners[0] = project(fx, py - hy, pz - hz);
+                corners[1] = project(fx, py + hy, pz - hz);
+                corners[2] = project(fx, py + hy, pz + hz);
+                corners[3] = project(fx, py - hy, pz + hz);
+            } else if (faceDragAxis_ == 2) {
+                float fy = py + faceDragSign_ * hy;
+                corners[0] = project(px - hx, fy, pz - hz);
+                corners[1] = project(px + hx, fy, pz - hz);
+                corners[2] = project(px + hx, fy, pz + hz);
+                corners[3] = project(px - hx, fy, pz + hz);
+            } else {
+                float fz = pz + faceDragSign_ * hz;
+                corners[0] = project(px - hx, py - hy, fz);
+                corners[1] = project(px + hx, py - hy, fz);
+                corners[2] = project(px + hx, py + hy, fz);
+                corners[3] = project(px - hx, py + hy, fz);
+            }
+
+            ImU32 fillCol, borderCol;
+            if (faceDragAxis_ == 1) {
+                fillCol   = IM_COL32(230, 60, 60, 45);
+                borderCol = IM_COL32(230, 60, 60, 220);
+            } else if (faceDragAxis_ == 2) {
+                fillCol   = IM_COL32(60, 230, 60, 45);
+                borderCol = IM_COL32(60, 230, 60, 220);
+            } else {
+                fillCol   = IM_COL32(60, 60, 230, 45);
+                borderCol = IM_COL32(60, 60, 230, 220);
+            }
+
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            dl->AddQuadFilled(corners[0], corners[1], corners[2], corners[3], fillCol);
+            dl->AddQuad(corners[0], corners[1], corners[2], corners[3], borderCol, 2.0f);
+        }
     }
 
     ImGui::Render();

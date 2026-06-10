@@ -123,7 +123,7 @@ float evalObject(vec3 p, PlacedObject obj) {
 
     float d;
     if (primType == 0) { // Box
-        d = sdBox(op, vec3(p1));
+        d = sdBox(op, vec3(p1, obj.rot.w, p2));
     } else if (primType == 1) { // Sphere
         d = sdSphere(op, p1);
     } else if (primType == 2) { // Donut (torus)
@@ -368,7 +368,7 @@ void main() {
 
         int giType = int(gType);
         if (giType == 0) { // Box
-            vec3 he = vec3(gP1);
+            vec3 he = vec3(gP1, ubo.ghostPrimInfo.w, gP2);
             vec3 c[8];
             for (int i = 0; i < 8; i++) {
                 float bx = float(i & 1) * 2.0 - 1.0;
@@ -447,11 +447,11 @@ void main() {
                 { body } \
             }
 
-        #define DRAW_SELECTED(gc, pType, pa1, pa2) \
+        #define DRAW_SELECTED(gc, pType, pa1, pa2, pa3) \
             { \
                 int _iType_ = int(pType); \
                 if (_iType_ == 0) { \
-                    vec3 he = vec3(pa1); \
+                    vec3 he = vec3(pa1, pa3, pa2); \
                     vec3 c[8]; \
                     for (int i = 0; i < 8; i++) { \
                         float bx = float(i & 1) * 2.0 - 1.0; \
@@ -496,13 +496,13 @@ void main() {
         // Outline for primary selection
         float bestDist = 1e10f;
         if (ubo.selectedValid > 0.5f) {
-            DRAW_SELECTED(ubo.selectedPos, ubo.selectedPrimInfo.x, ubo.selectedPrimInfo.y, ubo.selectedPrimInfo.z);
+            DRAW_SELECTED(ubo.selectedPos, ubo.selectedPrimInfo.x, ubo.selectedPrimInfo.y, ubo.selectedPrimInfo.z, ubo.selectedPrimInfo.w);
         }
 
         // Outline for additional multi-selected objects
         for (int _si_ = 0; _si_ < 32; _si_++) {
             if (ubo.selPos[_si_].w > 0.5f) {
-                DRAW_SELECTED(ubo.selPos[_si_].xyz, ubo.selInfo[_si_].x, ubo.selInfo[_si_].y, ubo.selInfo[_si_].z);
+                DRAW_SELECTED(ubo.selPos[_si_].xyz, ubo.selInfo[_si_].x, ubo.selInfo[_si_].y, ubo.selInfo[_si_].z, ubo.selInfo[_si_].w);
             }
         }
 

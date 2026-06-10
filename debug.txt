@@ -1,2 +1,0 @@
-[WARN] VK_LAYER_KHRONOS_validation not available
-viewProj[15]=0.601202

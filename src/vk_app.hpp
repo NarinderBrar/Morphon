@@ -24,6 +24,7 @@ enum class ToolType {
     Move,     // click-drag to move
     Rotate,   // rotate tool (TODO)
     Scale,    // scale tool (TODO)
+    Edit,     // edit selected object properties
     Box, Sphere, Donut, Cylinder, Pyramid  // placement tools
 };
 
@@ -108,6 +109,12 @@ private:
     // Drag start state for scale
     float dragObjSx_ = 0, dragObjSy_ = 0, dragObjSz_ = 0;
     std::vector<float> dragOrigSx_, dragOrigSy_, dragOrigSz_;
+
+    // Face editing drag state
+    int faceDragAxis_ = 0;    // 0=none, 1=X, 2=Y, 3=Z
+    float faceDragSign_ = 0;  // +1 or -1 for face direction
+    float faceDragOrigSx_ = 1.0f, faceDragOrigSy_ = 1.0f, faceDragOrigSz_ = 1.0f;
+    int faceDragStartX_ = 0, faceDragStartY_ = 0;
 
     // Vulkan core
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -248,6 +255,7 @@ private:
     int  gizmoHitTest(int screenX, int screenY);
     void startGizmoDrag(int screenX, int screenY);
     void doGizmoDrag(int screenX, int screenY);
+    void doFaceDrag(int screenX, int screenY);
     void executeBooleanOp();
     void updateTitle();
     void updateObjectBuffer();
